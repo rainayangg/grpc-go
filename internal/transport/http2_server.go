@@ -731,27 +731,35 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
 		frames, err := t.framer.komafr.ReadFrames()
+
+		// Rui: lookup the connMap to locate the st for the tcp connection
+		remoteAddr := t.framer.komafr.KomaSocket.RemoteAddr().String()
+		val, ok := m.Load(remoteAddr)
+		if !ok {
+			fmt.Sprintf("connection %s not found in the map!", remoteAddr)
+			return
+		}
+		tcpSt := val.(*http2Server)
+
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		if err != nil {
 			if se, ok := err.(http2.StreamError); ok {
 				if t.logger.V(logLevel) {
 					t.logger.Warningf("Encountered http2.StreamError: %v", se)
 				}
-				t.mu.Lock()
-				s := t.activeStreams[se.StreamID]
-				t.mu.Unlock()
+				tcpSt.mu.Lock()
+				s := tcpSt.activeStreams[se.StreamID]
+				tcpSt.mu.Unlock()
 				if s != nil {
-					t.closeStream(s, true, se.Code, false)
+					tcpSt.closeStream(s, true, se.Code, false)
 				} else {
-					t.framer.fr.WriteRSTStream(se.StreamID, se.Code)
+					tcpSt.framer.fr.WriteRSTStream(se.StreamID, se.Code)
 				}
 				continue
 			}
-			t.Close(err)
+			tcpSt.Close(err)
 			return
 		}
-
-		// Rui: lookup the connMap to locate the st.
 
 		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
 		var stream *ServerStream
@@ -762,7 +770,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				if err != nil {
 					// Any error processing client headers, e.g. invalid stream ID,
 					// is considered a protocol violation.
-					t.controlBuf.put(&goAway{
+					tcpSt.controlBuf.put(&goAway{
 						code:      http2.ErrCodeProtocol,
 						debugData: []byte(err.Error()),
 						closeConn: err,
