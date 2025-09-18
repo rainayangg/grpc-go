@@ -186,13 +186,9 @@ func dial(ctx context.Context, fn func(context.Context, string) (net.Conn, error
 
 func isTemporary(err error) bool {
 	switch err := err.(type) {
-	case interface {
-		Temporary() bool
-	}:
+	case interface{ Temporary() bool }:
 		return err.Temporary()
-	case interface {
-		Timeout() bool
-	}:
+	case interface{ Timeout() bool }:
 		// Timeouts may be resolved upon retry, and are thus treated as
 		// temporary.
 		return err.Timeout()
@@ -337,7 +333,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		writerDone:            make(chan struct{}),
 		goAway:                make(chan struct{}),
 		keepaliveDone:         make(chan struct{}),
-		framer:                newFramer(conn, writeBufSize, readBufSize, opts.SharedWriteBuffer, maxHeaderListSize),
+		framer:                newFramer(conn, writeBufSize, readBufSize, opts.SharedWriteBuffer, maxHeaderListSize, false),
 		fc:                    &trInFlow{limit: uint32(icwz)},
 		scheme:                scheme,
 		activeStreams:         make(map[uint32]*ClientStream),
@@ -1541,7 +1537,7 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 	}
 
 	if !isGRPC || httpStatusErr != "" {
-		var code = codes.Internal // when header does not include HTTP status, return INTERNAL
+		code := codes.Internal // when header does not include HTTP status, return INTERNAL
 
 		if httpStatusCode != nil {
 			var ok bool

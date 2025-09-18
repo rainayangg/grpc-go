@@ -49,6 +49,7 @@ import (
 	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/koma"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/stats"
@@ -141,7 +142,7 @@ type http2Server struct {
 // returns a nil transport and a non-nil error. For a special case where the
 // underlying conn gets closed before the client preface could be read, it
 // returns a nil transport and a nil error.
-func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport, err error) {
+func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ ServerTransport, err error) {
 	var authInfo credentials.AuthInfo
 	rawConn := conn
 	if config.Credentials != nil {
@@ -164,7 +165,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	if config.MaxHeaderListSize != nil {
 		maxHeaderListSize = *config.MaxHeaderListSize
 	}
-	framer := newFramer(conn, writeBufSize, readBufSize, config.SharedWriteBuffer, maxHeaderListSize)
+	framer := newFramer(conn, writeBufSize, readBufSize, config.SharedWriteBuffer, maxHeaderListSize, ifkoma)
 	// Send initial settings as connection preface to client.
 	isettings := []http2.Setting{{
 		ID:  http2.SettingMaxFrameSize,
@@ -190,7 +191,8 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	if iwz != defaultWindowSize {
 		isettings = append(isettings, http2.Setting{
 			ID:  http2.SettingInitialWindowSize,
-			Val: uint32(iwz)})
+			Val: uint32(iwz),
+		})
 	}
 	if config.MaxHeaderListSize != nil {
 		isettings = append(isettings, http2.Setting{
@@ -332,36 +334,40 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	}
 	t.handleSettings(sf)
 
-	go func() {
-		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger, t.outgoingGoAwayHandler, t.bufferPool)
-		err := t.loopy.run()
-		close(t.loopyWriterDone)
-		if !isIOError(err) {
-			// Close the connection if a non-I/O error occurs (for I/O errors
-			// the reader will also encounter the error and close).  Wait 1
-			// second before closing the connection, or when the reader is done
-			// (i.e. the client already closed the connection or a connection
-			// error occurred).  This avoids the potential problem where there
-			// is unread data on the receive side of the connection, which, if
-			// closed, would lead to a TCP RST instead of FIN, and the client
-			// encountering errors.  For more info:
-			// https://github.com/grpc/grpc-go/issues/5358
-			timer := time.NewTimer(time.Second)
-			defer timer.Stop()
-			select {
-			case <-t.readerDone:
-			case <-timer.C:
+	// Rui: LoopyWriter is only needed for rawTCP (send messages back to the students in the TX path),
+	// but unnecessary for the koma connection, as we decided not to use Koma TX path.
+	if !ifkoma {
+		go func() {
+			t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger, t.outgoingGoAwayHandler, t.bufferPool)
+			err := t.loopy.run()
+			close(t.loopyWriterDone)
+			if !isIOError(err) {
+				// Close the connection if a non-I/O error occurs (for I/O errors
+				// the reader will also encounter the error and close).  Wait 1
+				// second before closing the connection, or when the reader is done
+				// (i.e. the client already closed the connection or a connection
+				// error occurred).  This avoids the potential problem where there
+				// is unread data on the receive side of the connection, which, if
+				// closed, would lead to a TCP RST instead of FIN, and the client
+				// encountering errors.  For more info:
+				// https://github.com/grpc/grpc-go/issues/5358
+				timer := time.NewTimer(time.Second)
+				defer timer.Stop()
+				select {
+				case <-t.readerDone:
+				case <-timer.C:
+				}
+				t.conn.Close()
 			}
-			t.conn.Close()
-		}
-	}()
-	go t.keepalive()
+		}()
+		go t.keepalive()
+	}
 	return t, nil
 }
 
 // operateHeaders takes action on the decoded headers. Returns an error if fatal
 // error encountered and transport needs to close, otherwise returns nil.
-func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeadersFrame, handle func(*ServerStream)) error {
+func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeadersFrame, handle func(*ServerStream)) (*ServerStream, error) {
 	// Acquire max stream ID lock for entire duration
 	t.maxStreamMu.Lock()
 	defer t.maxStreamMu.Unlock()
@@ -377,12 +383,12 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			rstCode:  http2.ErrCodeFrameSize,
 			onWrite:  func() {},
 		})
-		return nil
+		return nil, nil
 	}
 
 	if streamID%2 != 1 || streamID <= t.maxStreamID {
 		// illegal gRPC stream id.
-		return fmt.Errorf("received an illegal stream id: %v. headers frame: %+v", streamID, frame)
+		return nil, fmt.Errorf("received an illegal stream id: %v. headers frame: %+v", streamID, frame)
 	}
 	t.maxStreamID = streamID
 
@@ -482,7 +488,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			status:         status.New(codes.Internal, errMsg),
 			rst:            !frame.StreamEnded(),
 		})
-		return nil
+		return s, nil
 	}
 
 	if protocolError {
@@ -492,7 +498,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			rstCode:  http2.ErrCodeProtocol,
 			onWrite:  func() {},
 		})
-		return nil
+		return s, nil
 	}
 	if !isGRPC {
 		t.controlBuf.put(&earlyAbortStream{
@@ -502,7 +508,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			status:         status.Newf(codes.InvalidArgument, "invalid gRPC request content-type %q", contentType),
 			rst:            !frame.StreamEnded(),
 		})
-		return nil
+		return s, nil
 	}
 	if headerError != nil {
 		t.controlBuf.put(&earlyAbortStream{
@@ -512,7 +518,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			status:         headerError,
 			rst:            !frame.StreamEnded(),
 		})
-		return nil
+		return s, nil
 	}
 
 	// "If :authority is missing, Host must be renamed to :authority." - A41
@@ -546,7 +552,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 	if t.state != reachable {
 		t.mu.Unlock()
 		s.cancel()
-		return nil
+		return s, nil
 	}
 	if uint32(len(t.activeStreams)) >= t.maxStreams {
 		t.mu.Unlock()
@@ -557,7 +563,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			onWrite:  func() {},
 		})
 		s.cancel()
-		return nil
+		return s, nil
 	}
 	if httpMethod != http.MethodPost {
 		t.mu.Unlock()
@@ -573,7 +579,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			rst:            !frame.StreamEnded(),
 		})
 		s.cancel()
-		return nil
+		return s, nil
 	}
 	if t.inTapHandle != nil {
 		var err error
@@ -593,7 +599,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 				status:         stat,
 				rst:            !frame.StreamEnded(),
 			})
-			return nil
+			return s, nil
 		}
 	}
 	t.activeStreams[streamID] = s
@@ -642,7 +648,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		wq:       s.wq,
 	})
 	handle(s)
-	return nil
+	return s, nil
 }
 
 // HandleStreams receives incoming streams using the given handler. This is
@@ -682,7 +688,7 @@ func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStre
 		}
 		switch frame := frame.(type) {
 		case *http2.MetaHeadersFrame:
-			if err := t.operateHeaders(ctx, frame, handle); err != nil {
+			if _, err := t.operateHeaders(ctx, frame, handle); err != nil {
 				// Any error processing client headers, e.g. invalid stream ID,
 				// is considered a protocol violation.
 				t.controlBuf.put(&goAway{
@@ -712,6 +718,84 @@ func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStre
 	}
 }
 
+// HandleStreamsKoma receives incoming streams. The difference from the default one is that we do not give them to any handler directly. Instead, the handler function is called directly in serverWorker().
+func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle func(*ServerStream)) {
+	defer func() {
+		close(t.readerDone)
+		<-t.loopyWriterDone
+	}()
+	for {
+		t.controlBuf.throttle()
+		// Rui: komaPull which tries to pull a message from the in-kernel central queue.
+		koma.KomaPull(komafd)
+		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
+		frames, err := t.framer.komafr.ReadFrames()
+		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+		if err != nil {
+			if se, ok := err.(http2.StreamError); ok {
+				if t.logger.V(logLevel) {
+					t.logger.Warningf("Encountered http2.StreamError: %v", se)
+				}
+				t.mu.Lock()
+				s := t.activeStreams[se.StreamID]
+				t.mu.Unlock()
+				if s != nil {
+					t.closeStream(s, true, se.Code, false)
+				} else {
+					t.framer.fr.WriteRSTStream(se.StreamID, se.Code)
+				}
+				continue
+			}
+			t.Close(err)
+			return
+		}
+
+		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
+		var stream *ServerStream
+		for _, frame := range frames {
+			switch frame := frame.(type) {
+			case *http2.MetaHeadersFrame:
+				s, err := t.operateHeaders(ctx, frame, func(*ServerStream) {})
+				if err != nil {
+					// Any error processing client headers, e.g. invalid stream ID,
+					// is considered a protocol violation.
+					t.controlBuf.put(&goAway{
+						code:      http2.ErrCodeProtocol,
+						debugData: []byte(err.Error()),
+						closeConn: err,
+					})
+					continue
+				}
+				stream = s
+			case *http2.DataFrame:
+				t.handleData(frame)
+			case *http2.RSTStreamFrame:
+				t.handleRSTStream(frame)
+			case *http2.SettingsFrame:
+				t.handleSettings(frame)
+			case *http2.PingFrame:
+				t.handlePing(frame)
+			case *http2.WindowUpdateFrame:
+				t.handleWindowUpdate(frame)
+			case *http2.GoAwayFrame:
+				// TODO: Handle GoAway from the client appropriately.
+			default:
+				if t.logger.V(logLevel) {
+					t.logger.Infof("Received unsupported frame type %T", frame)
+				}
+
+			}
+		}
+
+		// Rui: finish processing frames of the current stream, call handlestream to do rpc-level processing.
+		// In the original gRPC setting, whenever a new stream is detected (from `MetaHeaderFrame`), the handle function
+		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
+		// the associated stream (which involves blocking and waiting), ii) assign a go-routine worker to do the associated work.
+		handle(stream)
+
+	}
+}
+
 func (t *http2Server) getStream(f http2.Frame) (*ServerStream, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -734,7 +818,6 @@ func (t *http2Server) adjustWindow(s *ServerStream, n uint32) {
 	if w := s.fc.maybeAdjust(n); w > 0 {
 		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.id, increment: w})
 	}
-
 }
 
 // updateWindow adjusts the inbound quota for the stream and the transport.
@@ -742,7 +825,8 @@ func (t *http2Server) adjustWindow(s *ServerStream, n uint32) {
 // the cumulative quota exceeds the corresponding threshold.
 func (t *http2Server) updateWindow(s *ServerStream, n uint32) {
 	if w := s.fc.onRead(n); w > 0 {
-		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.id,
+		t.controlBuf.put(&outgoingWindowUpdate{
+			streamID:  s.id,
 			increment: w,
 		})
 	}
@@ -770,7 +854,6 @@ func (t *http2Server) updateFlowControl(n uint32) {
 			},
 		},
 	})
-
 }
 
 func (t *http2Server) handleData(f *http2.DataFrame) {

@@ -385,6 +385,9 @@ func (ht *serverHandlerTransport) writeHeader(s *ServerStream, md metadata.MD) e
 	return err
 }
 
+func (ht *serverHandlerTransport) HandleStreamsKoma(ctx context.Context, komafd int, handle func(*ServerStream)) {
+}
+
 func (ht *serverHandlerTransport) HandleStreams(ctx context.Context, startStream func(*ServerStream)) {
 	// With this transport type there will be exactly 1 stream: this HTTP request.
 	var cancel context.CancelFunc

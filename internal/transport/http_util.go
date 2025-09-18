@@ -394,12 +394,16 @@ func toIOError(err error) error {
 type framer struct {
 	writer *bufWriter
 	fr     *http2.Framer
+	komafr *http2.KomaFramer
 }
 
-var writeBufferPoolMap = make(map[int]*sync.Pool)
-var writeBufferMutex sync.Mutex
+var (
+	writeBufferPoolMap = make(map[int]*sync.Pool)
+	writeBufferMutex   sync.Mutex
+)
 
-func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, sharedWriteBuffer bool, maxHeaderListSize uint32) *framer {
+// Rui: changes here so that for Koma socket, a dedicated komaFramer is created internally
+func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, sharedWriteBuffer bool, maxHeaderListSize uint32, ifkoma bool) *framer {
 	if writeBufferSize < 0 {
 		writeBufferSize = 0
 	}
@@ -412,9 +416,17 @@ func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, sharedWriteBu
 		pool = getWriteBufferPool(writeBufferSize)
 	}
 	w := newBufWriter(conn, writeBufferSize, pool)
-	f := &framer{
-		writer: w,
-		fr:     http2.NewFramer(w, r),
+	var f *framer
+	if ifkoma {
+		f = &framer{
+			writer: w,
+			fr:     http2.NewFramer(w, r),
+		}
+	} else {
+		f = &framer{
+			writer: w,
+			komafr: http2.NewKomaFramer(conn),
+		}
 	}
 	f.fr.SetMaxReadFrameSize(http2MaxFrameLen)
 	// Opt-in to Frame reuse API on framer to reduce garbage.

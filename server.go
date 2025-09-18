@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
@@ -47,6 +48,7 @@ import (
 	istats "google.golang.org/grpc/internal/stats"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/koma"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -89,8 +91,10 @@ func init() {
 	}
 }
 
-var statusOK = status.New(codes.OK, "")
-var logger = grpclog.Component("core")
+var (
+	statusOK = status.New(codes.OK, "")
+	logger   = grpclog.Component("core")
+)
 
 // MethodHandler is a function type that processes a unary RPC method call.
 type MethodHandler func(srv any, ctx context.Context, dec func(any) error, interceptor UnaryServerInterceptor) (any, error)
@@ -148,6 +152,9 @@ type Server struct {
 
 	serverWorkerChannel      chan func()
 	serverWorkerChannelClose func()
+	bpf_progfd               int // the fd for the bpf program to be attached to koma socket.
+	// TODO(Rui): grpc-koma does not need ebpf program anyway, to be removed after the bpf part is removed in the koma code
+	komafds []int // all koma sockets belonging to this server
 }
 
 type serverOptions struct {
@@ -634,14 +641,47 @@ const serverWorkerResetThreshold = 1 << 16
 //
 // [1] https://github.com/golang/go/issues/18138
 func (s *Server) serverWorker() {
-	for completed := 0; completed < serverWorkerResetThreshold; completed++ {
-		f, ok := <-s.serverWorkerChannel
-		if !ok {
-			return
-		}
-		f()
+	//for completed := 0; completed < serverWorkerResetThreshold; completed++ {
+	//f, ok := <-s.serverWorkerChannel
+	//if !ok {
+	//return
+	//}
+	//f()
+	//}
+	//go s.serverWorker()
+	komafd := koma.KomaInit()
+	fmt.Printf("Initialize KOMA socket %d", komafd)
+
+	// TODO(Rui): locking here for concurrent access to the shared list of all koma fds
+	s.komafds = append(s.komafds, komafd)
+	komaConn, _ := http2.NewKomaConn(komafd)
+
+	// create a dedicated new transport for the koma connection, note that it is
+	// different from the serverTransport of a normal TCP connection
+	st := s.newHTTP2Transport(komaConn, true)
+
+	ctx := transport.SetConnection(context.Background(), komaConn)
+	ctx = peer.NewContext(ctx, st.Peer())
+
+	for _, sh := range s.opts.statsHandlers {
+		sh.HandleConn(ctx, &stats.ConnEnd{})
 	}
-	go s.serverWorker()
+
+	defer func() {
+		st.Close(errors.New("finished serving streams for the server transport"))
+		for _, sh := range s.opts.statsHandlers {
+			sh.HandleConn(ctx, &stats.ConnEnd{})
+		}
+	}()
+
+	streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
+	st.HandleStreamsKoma(ctx, int(komafd), func(stream *transport.ServerStream) {
+		s.handlersWG.Add(1)
+		streamQuota.acquire()
+		defer streamQuota.release()
+		defer s.handlersWG.Done()
+		s.handleStream(st, stream)
+	})
 }
 
 // initServerWorkers creates worker goroutines and a channel to process incoming
@@ -868,7 +908,8 @@ func (s *Server) Serve(lis net.Listener) error {
 			Parent:        s.channelz,
 			RefName:       lis.Addr().String(),
 			LocalAddr:     lis.Addr(),
-			SocketOptions: channelz.GetSocketOption(lis)},
+			SocketOptions: channelz.GetSocketOption(lis),
+		},
 		),
 	}
 	s.lis[ls] = true
@@ -884,6 +925,11 @@ func (s *Server) Serve(lis net.Listener) error {
 
 	s.mu.Unlock()
 	channelz.Info(logger, ls.channelz, "ListenSocket created")
+
+	// Rui: initialize the bpf program
+	// TODO(Rui): check if its done correctly
+	s.bpf_progfd = koma.BpfInit("memcache-id")
+	fmt.Printf("BPF program initialized %d\n", s.bpf_progfd)
 
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
@@ -935,6 +981,20 @@ func (s *Server) Serve(lis net.Listener) error {
 	}
 }
 
+func getFdFromTCPConn(conn net.Conn) (int, error) {
+	tcpConn := conn.(*net.TCPConn)
+	rawConn, err := tcpConn.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+
+	var fd int
+	err = rawConn.Control(func(f uintptr) {
+		fd = int(f)
+	})
+	return fd, err
+}
+
 // handleRawConn forks a goroutine to handle a just-accepted connection that
 // has not had any I/O performed on it yet.
 func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
@@ -945,7 +1005,9 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	rawConn.SetDeadline(time.Now().Add(s.opts.connectionTimeout))
 
 	// Finish handshaking (HTTP2)
-	st := s.newHTTP2Transport(rawConn)
+	// Rui: serverTransport for the raw TCP connection is needed because
+	// we use it for the TX path.
+	st := s.newHTTP2Transport(rawConn, false)
 	rawConn.SetDeadline(time.Time{})
 	if st == nil {
 		return
@@ -960,15 +1022,27 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	if !s.addConn(lisAddr, st) {
 		return
 	}
-	go func() {
-		s.serveStreams(context.Background(), st, rawConn)
-		s.removeConn(lisAddr, st)
-	}()
+
+	// Rui: the following original go routine func() is commented, because
+	// we no longer read from the TCP streams in the RX path anymore
+	//go func() {
+	//s.serveStreams(context.Background(), st, rawConn)
+	//s.removeConn(lisAddr, st)
+	//}()
+	fd, err := getFdFromTCPConn(rawConn)
+	if err != nil {
+		fmt.Printf("failed to get new TCP connection fd")
+	}
+
+	ierr := koma.KomaAttach(s.komafds[0], fd, s.bpf_progfd)
+	if ierr == -1 {
+		fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
+	}
 }
 
 // newHTTP2Transport sets up a http/2 transport (using the
 // gRPC http2 server transport in transport/http2_server.go).
-func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
+func (s *Server) newHTTP2Transport(c net.Conn, ifkoma bool) transport.ServerTransport {
 	config := &transport.ServerConfig{
 		MaxStreams:            s.opts.maxConcurrentStreams,
 		ConnectionTimeout:     s.opts.connectionTimeout,
@@ -987,7 +1061,7 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
 		HeaderTableSize:       s.opts.headerTableSize,
 		BufferPool:            s.opts.bufferPool,
 	}
-	st, err := transport.NewServerTransport(c, config)
+	st, err := transport.NewServerTransport(c, config, ifkoma)
 	if err != nil {
 		s.mu.Lock()
 		s.errorf("NewServerTransport(%q) failed: %v", c.RemoteAddr(), err)
