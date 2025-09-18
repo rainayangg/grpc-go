@@ -1,0 +1,25 @@
+package koma
+
+/*
+#cgo CFLAGS: -I${SRCDIR}
+#cgo LDFLAGS: -lbcc -lm
+#include "common-koma.h"
+*/
+import "C"
+
+// wrapper functions in Go
+func KomaPull(fd int) int {
+	return int(C.koma_pull(C.int(fd)))
+}
+
+func KomaInit() int {
+	return int(C.koma_init())
+}
+
+func KomaAttach(fd int, csock int, bpf_prog_fd int) int {
+	return int(C.koma_attach(C.int(fd), C.int(csock), C.int(bpf_prog_fd)))
+}
+
+func BpfInit(str string) int {
+	return int(C.bpf_init(C.CString(str)))
+}
