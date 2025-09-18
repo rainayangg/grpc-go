@@ -155,6 +155,9 @@ type Server struct {
 	bpf_progfd               int // the fd for the bpf program to be attached to koma socket.
 	// TODO(Rui): grpc-koma does not need ebpf program anyway, to be removed after the bpf part is removed in the koma code
 	komafds []int // all koma sockets belonging to this server
+
+	// Rui: @connMap stores the mapping between a tcp connection key and the serverTransport of this TCP connection.
+	connMap sync.Map
 }
 
 type serverOptions struct {
@@ -863,6 +866,13 @@ func (l *listenSocket) Close() error {
 	return err
 }
 
+// Rui: helper to make a unique key from IP+port
+type ConnKey string
+
+func makeConnKey(ip net.IP, port int) ConnKey {
+	return ConnKey(fmt.Sprintf("%s:%d", ip.String(), port))
+}
+
 // Serve accepts incoming connections on the listener lis, creating a new
 // ServerTransport and service goroutine for each. The service goroutines
 // read gRPC requests and then call the registered handlers to reply to them.
@@ -1038,6 +1048,11 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	if ierr == -1 {
 		fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
 	}
+
+	// Rui: store the accepted TCP connection in the map of the server.
+	tcpAddr := rawConn.RemoteAddr().(*net.TCPAddr)
+	key := ConnKey(fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port))
+	s.connMap.Store(key, st)
 }
 
 // newHTTP2Transport sets up a http/2 transport (using the
