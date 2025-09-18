@@ -719,7 +719,7 @@ func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStre
 }
 
 // HandleStreamsKoma receives incoming streams. The difference from the default one is that we do not give them to any handler directly. Instead, the handler function is called directly in serverWorker().
-func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle func(*ServerStream)) {
+func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd int, handle func(*ServerStream)) {
 	defer func() {
 		close(t.readerDone)
 		<-t.loopyWriterDone
@@ -728,6 +728,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		t.controlBuf.throttle()
 		// Rui: komaPull which tries to pull a message from the in-kernel central queue.
 		koma.KomaPull(komafd)
+
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
 		frames, err := t.framer.komafr.ReadFrames()
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
@@ -749,6 +750,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			t.Close(err)
 			return
 		}
+
+		// Rui: lookup the connMap to locate the st.
 
 		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
 		var stream *ServerStream
