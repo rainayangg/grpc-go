@@ -725,7 +725,9 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		<-t.loopyWriterDone
 	}()
 	for {
-		t.controlBuf.throttle()
+		// Rui: comment the following line because we do not need controlbuf for koma serverTransport
+		// t.controlBuf.throttle()
+
 		// Rui: komaPull which tries to pull a message from the in-kernel central queue.
 		koma.KomaPull(komafd)
 
@@ -766,7 +768,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		for _, frame := range frames {
 			switch frame := frame.(type) {
 			case *http2.MetaHeadersFrame:
-				s, err := t.operateHeaders(ctx, frame, func(*ServerStream) {})
+				s, err := tcpSt.operateHeaders(ctx, frame, func(*ServerStream) {})
 				if err != nil {
 					// Any error processing client headers, e.g. invalid stream ID,
 					// is considered a protocol violation.
@@ -779,15 +781,15 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				}
 				stream = s
 			case *http2.DataFrame:
-				t.handleData(frame)
+				tcpSt.handleData(frame)
 			case *http2.RSTStreamFrame:
-				t.handleRSTStream(frame)
+				tcpSt.handleRSTStream(frame)
 			case *http2.SettingsFrame:
-				t.handleSettings(frame)
+				tcpSt.handleSettings(frame)
 			case *http2.PingFrame:
-				t.handlePing(frame)
+				tcpSt.handlePing(frame)
 			case *http2.WindowUpdateFrame:
-				t.handleWindowUpdate(frame)
+				tcpSt.handleWindowUpdate(frame)
 			case *http2.GoAwayFrame:
 				// TODO: Handle GoAway from the client appropriately.
 			default:
