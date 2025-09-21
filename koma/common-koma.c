@@ -22,7 +22,8 @@ int bpf_init(const char *service_proto) {
   if (strcmp(service_proto, "memcache-bin") == 0) {
     strcpy(bpf_prog, "memcache-bin_kern.c");
   } else if (strcmp(service_proto, "memcache-id") == 0) {
-    strcpy(bpf_prog, "../memcache-id_kern.c");
+    // assume the bpf program is in the parent folder of grpc-go
+    strcpy(bpf_prog, "../../memcache-id_kern.c");
   } else {
     printf("Unknown protocol: %s\n", service_proto);
     exit(1);
