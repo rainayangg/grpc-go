@@ -206,8 +206,14 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 			Val: *config.HeaderTableSize,
 		})
 	}
-	if err := framer.fr.WriteSettings(isettings...); err != nil {
-		return nil, connectionErrorf(false, err, "transport: %v", err)
+	if !ifkoma {
+		if err := framer.fr.WriteSettings(isettings...); err != nil {
+			return nil, connectionErrorf(false, err, "transport: %v", err)
+		}
+	} else {
+		if err := framer.komafr.WriteSettings(isettings...); err != nil {
+			return nil, connectionErrorf(false, err, "transport: %v", err)
+		}
 	}
 	// Adjust the connection flow control window if needed.
 	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
@@ -286,53 +292,55 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 	)
 	t.logger = prefixLoggerForServerTransport(t)
 
-	t.controlBuf = newControlBuffer(t.done)
-	if dynamicWindow {
-		t.bdpEst = &bdpEstimator{
-			bdp:               initialWindowSize,
-			updateFlowControl: t.updateFlowControl,
+	if !ifkoma {
+		t.controlBuf = newControlBuffer(t.done)
+		if dynamicWindow {
+			t.bdpEst = &bdpEstimator{
+				bdp:               initialWindowSize,
+				updateFlowControl: t.updateFlowControl,
+			}
 		}
-	}
 
-	t.connectionID = atomic.AddUint64(&serverConnectionCounter, 1)
-	t.framer.writer.Flush()
+		t.connectionID = atomic.AddUint64(&serverConnectionCounter, 1)
+		t.framer.writer.Flush()
 
-	defer func() {
+		defer func() {
+			if err != nil {
+				t.Close(err)
+			}
+		}()
+
+		// Check the validity of client preface.
+		preface := make([]byte, len(clientPreface))
+		if _, err := io.ReadFull(t.conn, preface); err != nil {
+			// In deployments where a gRPC server runs behind a cloud load balancer
+			// which performs regular TCP level health checks, the connection is
+			// closed immediately by the latter.  Returning io.EOF here allows the
+			// grpc server implementation to recognize this scenario and suppress
+			// logging to reduce spam.
+			if err == io.EOF {
+				return nil, io.EOF
+			}
+			return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to receive the preface from client: %v", err)
+		}
+		if !bytes.Equal(preface, clientPreface) {
+			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
+		}
+
+		frame, err := t.framer.fr.ReadFrame()
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil, err
+		}
 		if err != nil {
-			t.Close(err)
+			return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to read initial settings frame: %v", err)
 		}
-	}()
-
-	// Check the validity of client preface.
-	preface := make([]byte, len(clientPreface))
-	if _, err := io.ReadFull(t.conn, preface); err != nil {
-		// In deployments where a gRPC server runs behind a cloud load balancer
-		// which performs regular TCP level health checks, the connection is
-		// closed immediately by the latter.  Returning io.EOF here allows the
-		// grpc server implementation to recognize this scenario and suppress
-		// logging to reduce spam.
-		if err == io.EOF {
-			return nil, io.EOF
+		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+		sf, ok := frame.(*http2.SettingsFrame)
+		if !ok {
+			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
 		}
-		return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to receive the preface from client: %v", err)
+		t.handleSettings(sf)
 	}
-	if !bytes.Equal(preface, clientPreface) {
-		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
-	}
-
-	frame, err := t.framer.fr.ReadFrame()
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return nil, err
-	}
-	if err != nil {
-		return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to read initial settings frame: %v", err)
-	}
-	atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
-	sf, ok := frame.(*http2.SettingsFrame)
-	if !ok {
-		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
-	}
-	t.handleSettings(sf)
 
 	// Rui: LoopyWriter is only needed for rawTCP (send messages back to the students in the TX path),
 	// but unnecessary for the koma connection, as we decided not to use Koma TX path.

@@ -417,23 +417,31 @@ func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, sharedWriteBu
 	}
 	w := newBufWriter(conn, writeBufferSize, pool)
 	var f *framer
-	if ifkoma {
+	if !ifkoma {
 		f = &framer{
 			writer: w,
 			fr:     http2.NewFramer(w, r),
 		}
+		f.fr.SetMaxReadFrameSize(http2MaxFrameLen)
+		// Opt-in to Frame reuse API on framer to reduce garbage.
+		// Frames aren't safe to read from after a subsequent call to ReadFrame.
+		f.fr.SetReuseFrames()
+		f.fr.MaxHeaderListSize = maxHeaderListSize
+		f.fr.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
+
 	} else {
 		f = &framer{
 			writer: w,
 			komafr: http2.NewKomaFramer(conn),
 		}
+		f.komafr.SetMaxReadFrameSize(http2MaxFrameLen)
+		// Opt-in to Frame reuse API on framer to reduce garbage.
+		// Frames aren't safe to read from after a subsequent call to ReadFrame.
+		f.komafr.SetReuseFrames()
+		f.komafr.MaxHeaderListSize = maxHeaderListSize
+		f.komafr.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
+
 	}
-	f.fr.SetMaxReadFrameSize(http2MaxFrameLen)
-	// Opt-in to Frame reuse API on framer to reduce garbage.
-	// Frames aren't safe to read from after a subsequent call to ReadFrame.
-	f.fr.SetReuseFrames()
-	f.fr.MaxHeaderListSize = maxHeaderListSize
-	f.fr.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
 	return f
 }
 
