@@ -423,6 +423,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		err = connectionErrorf(true, err, "transport: failed to write client preface: %v", err)
 		return nil, err
 	}
+	fmt.Printf("Client: send preface to the server\n")
 	if n != len(clientPreface) {
 		err = connectionErrorf(true, nil, "transport: preface mismatch, wrote %d bytes; want %d", n, len(clientPreface))
 		return nil, err

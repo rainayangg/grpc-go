@@ -211,9 +211,9 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 			return nil, connectionErrorf(false, err, "transport: %v", err)
 		}
 	} else {
-		if err := framer.komafr.WriteSettings(isettings...); err != nil {
-			return nil, connectionErrorf(false, err, "transport: %v", err)
-		}
+		//if err := framer.komafr.WriteSettings(isettings...); err != nil {
+		//return nil, connectionErrorf(false, err, "transport: %v", err)
+		//}
 	}
 	// Adjust the connection flow control window if needed.
 	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
@@ -326,6 +326,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		if !bytes.Equal(preface, clientPreface) {
 			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
 		}
+		fmt.Printf("Server receives preface from the client!\n")
 
 		frame, err := t.framer.fr.ReadFrame()
 		if err == io.EOF || err == io.ErrUnexpectedEOF {

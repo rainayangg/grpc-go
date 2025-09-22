@@ -653,16 +653,19 @@ func (s *Server) serverWorker() {
 	//}
 	//go s.serverWorker()
 	komafd := koma.KomaInit()
-	fmt.Printf("Initialize KOMA socket %d", komafd)
+	fmt.Printf("Initialize KOMA socket %d\n", komafd)
 
 	// TODO(Rui): locking here for concurrent access to the shared list of all koma fds
+	s.mu.Lock()
 	s.komafds = append(s.komafds, komafd)
+	s.mu.Unlock()
 	komaConn, _ := http2.NewKomaConn(komafd)
 
 	// create a dedicated new transport for the koma connection, note that it is
 	// different from the serverTransport of a normal TCP connection
 	st := s.newHTTP2Transport(komaConn, true)
 
+	fmt.Printf("create a new HTTP transport for KOMA socket %d\n", komafd)
 	ctx := transport.SetConnection(context.Background(), komaConn)
 	ctx = peer.NewContext(ctx, st.Peer())
 
@@ -727,6 +730,7 @@ func NewServer(opt ...ServerOption) *Server {
 	}
 
 	if s.opts.numServerWorkers > 0 {
+		fmt.Printf("start %d server workers\n", s.opts.numServerWorkers)
 		s.initServerWorkers()
 	}
 
@@ -873,6 +877,20 @@ func makeConnKey(ip net.IP, port int) ConnKey {
 	return ConnKey(fmt.Sprintf("%s:%d", ip.String(), port))
 }
 
+func getFdFromTCPConn(conn net.Conn) (int, error) {
+	tcpConn := conn.(*net.TCPConn)
+	rawConn, err := tcpConn.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+
+	var fd int
+	err = rawConn.Control(func(f uintptr) {
+		fd = int(f)
+	})
+	return fd, err
+}
+
 // Serve accepts incoming connections on the listener lis, creating a new
 // ServerTransport and service goroutine for each. The service goroutines
 // read gRPC requests and then call the registered handlers to reply to them.
@@ -944,6 +962,17 @@ func (s *Server) Serve(lis net.Listener) error {
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
 		rawConn, err := lis.Accept()
+		fd, ferr := getFdFromTCPConn(rawConn)
+		if ferr != nil {
+			fmt.Printf("failed to get new TCP connection fd")
+		}
+
+		ierr := koma.KomaAttach(s.komafds[0], fd, s.bpf_progfd)
+		if ierr == -1 {
+			fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
+		}
+		fmt.Printf("Accept new TCP connection, attach to KOMA\n")
+
 		if err != nil {
 			if ne, ok := err.(interface {
 				Temporary() bool
@@ -991,20 +1020,6 @@ func (s *Server) Serve(lis net.Listener) error {
 	}
 }
 
-func getFdFromTCPConn(conn net.Conn) (int, error) {
-	tcpConn := conn.(*net.TCPConn)
-	rawConn, err := tcpConn.SyscallConn()
-	if err != nil {
-		return -1, err
-	}
-
-	var fd int
-	err = rawConn.Control(func(f uintptr) {
-		fd = int(f)
-	})
-	return fd, err
-}
-
 // handleRawConn forks a goroutine to handle a just-accepted connection that
 // has not had any I/O performed on it yet.
 func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
@@ -1023,6 +1038,11 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 		return
 	}
 
+	// Rui: store the accepted TCP connection in the map of the server.
+	tcpAddr := rawConn.RemoteAddr().(*net.TCPAddr)
+	key := ConnKey(fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port))
+	s.connMap.Store(key, st)
+
 	if cc, ok := rawConn.(interface {
 		PassServerTransport(transport.ServerTransport)
 	}); ok {
@@ -1039,20 +1059,6 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	//s.serveStreams(context.Background(), st, rawConn)
 	//s.removeConn(lisAddr, st)
 	//}()
-	fd, err := getFdFromTCPConn(rawConn)
-	if err != nil {
-		fmt.Printf("failed to get new TCP connection fd")
-	}
-
-	ierr := koma.KomaAttach(s.komafds[0], fd, s.bpf_progfd)
-	if ierr == -1 {
-		fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
-	}
-
-	// Rui: store the accepted TCP connection in the map of the server.
-	tcpAddr := rawConn.RemoteAddr().(*net.TCPAddr)
-	key := ConnKey(fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port))
-	s.connMap.Store(key, st)
 }
 
 // newHTTP2Transport sets up a http/2 transport (using the
