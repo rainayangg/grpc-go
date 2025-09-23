@@ -293,6 +293,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 	t.logger = prefixLoggerForServerTransport(t)
 
 	if !ifkoma {
+		// Create control buf for vanilla TCP transport
 		t.controlBuf = newControlBuffer(t.done)
 		if dynamicWindow {
 			t.bdpEst = &bdpEstimator{
@@ -309,8 +310,9 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 				t.Close(err)
 			}
 		}()
-
-		// Check the validity of client preface.
+	} else {
+		// Rui: In koma socket, check the validity of client preface.
+		fmt.Printf("Koma socket checks preface!\n")
 		preface := make([]byte, len(clientPreface))
 		if _, err := io.ReadFull(t.conn, preface); err != nil {
 			// In deployments where a gRPC server runs behind a cloud load balancer
@@ -326,21 +328,53 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		if !bytes.Equal(preface, clientPreface) {
 			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
 		}
-		fmt.Printf("Server receives preface from the client!\n")
+		fmt.Printf("Koma socket receives preface from the client!\n")
 
-		frame, err := t.framer.fr.ReadFrame()
+		// Rui: only use here temporarily to read one single frame
+		kconn, kok := conn.(*http2.KomaConn)
+		if !kok {
+			fmt.Printf("Not Koma socket!\n")
+			return
+		}
+
+		koma.KomaPull(kconn.GetFd())
+
+		// need to call koma_pull first
+		frame, err := t.framer.komafr.ReadFrame()
+		fmt.Printf("Koma socket receives first frame after preface!\n")
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			fmt.Printf("Koma socket fails to read initial settings frame 1\n")
 			return nil, err
 		}
 		if err != nil {
+			fmt.Printf("Koma socket fails to read initial settings frame 2\n")
 			return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to read initial settings frame: %v", err)
 		}
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		sf, ok := frame.(*http2.SettingsFrame)
 		if !ok {
+			fmt.Printf("Koma socket fails to read initial settings frame 3\n")
 			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
 		}
-		t.handleSettings(sf)
+		fmt.Printf("Koma socket receives the initial settings frame!\n")
+
+		// print map
+		fmt.Printf("print map!\n")
+		kconn.GetMap().Range(func(key, value any) bool {
+			fmt.Printf("key=%v, value=%v\n", key, value)
+			fmt.Println(kconn.RemoteAddr().String() == key)
+			return true // keep iterating
+		})
+		remoteAddr := kconn.RemoteAddr().String()
+		val, ok := kconn.GetMap().Load(remoteAddr)
+		if !ok {
+			fmt.Printf("connection %s not found in the map!\n", remoteAddr)
+			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams cannot find the associated TCP connection tor respond")
+		}
+		tcpSt := val.(*http2Server)
+		fmt.Printf("Koma socket to send the settings ack\n")
+		tcpSt.handleSettings(sf)
+
 	}
 
 	// Rui: LoopyWriter is only needed for rawTCP (send messages back to the students in the TX path),
@@ -1568,6 +1602,7 @@ func (t *http2Server) getOutFlowWindow() int64 {
 
 // Peer returns the peer of the transport.
 func (t *http2Server) Peer() *peer.Peer {
+	fmt.Printf("enter Peer fuc!\n")
 	return &peer.Peer{
 		Addr:      t.peer.Addr,
 		LocalAddr: t.peer.LocalAddr,

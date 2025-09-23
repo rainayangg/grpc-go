@@ -1628,6 +1628,7 @@ func (t *http2Client) readServerPreface() error {
 	if !ok {
 		return connectionErrorf(true, nil, "initial http2 frame from server is not a settings frame: %T", frame)
 	}
+	fmt.Printf("client receives from the server Settings!\n")
 	t.handleSettings(sf, true)
 	return nil
 }

@@ -659,7 +659,7 @@ func (s *Server) serverWorker() {
 	s.mu.Lock()
 	s.komafds = append(s.komafds, komafd)
 	s.mu.Unlock()
-	komaConn, _ := http2.NewKomaConn(komafd)
+	komaConn, _ := http2.NewKomaConn(komafd, &s.connMap)
 
 	// create a dedicated new transport for the koma connection, note that it is
 	// different from the serverTransport of a normal TCP connection
@@ -667,6 +667,8 @@ func (s *Server) serverWorker() {
 
 	fmt.Printf("create a new HTTP transport for KOMA socket %d\n", komafd)
 	ctx := transport.SetConnection(context.Background(), komaConn)
+
+	fmt.Printf("create context for peer %d %+v\n", komafd, st)
 	ctx = peer.NewContext(ctx, st.Peer())
 
 	for _, sh := range s.opts.statsHandlers {
@@ -877,7 +879,7 @@ func makeConnKey(ip net.IP, port int) ConnKey {
 	return ConnKey(fmt.Sprintf("%s:%d", ip.String(), port))
 }
 
-func getFdFromTCPConn(conn net.Conn) (int, error) {
+func GetFdFromTCPConn(conn net.Conn) (int, error) {
 	tcpConn := conn.(*net.TCPConn)
 	rawConn, err := tcpConn.SyscallConn()
 	if err != nil {
@@ -962,7 +964,7 @@ func (s *Server) Serve(lis net.Listener) error {
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
 		rawConn, err := lis.Accept()
-		fd, ferr := getFdFromTCPConn(rawConn)
+		fd, ferr := GetFdFromTCPConn(rawConn)
 		if ferr != nil {
 			fmt.Printf("failed to get new TCP connection fd")
 		}
@@ -1032,6 +1034,9 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	// Finish handshaking (HTTP2)
 	// Rui: serverTransport for the raw TCP connection is needed because
 	// we use it for the TX path.
+
+	fd, _ := GetFdFromTCPConn(rawConn)
+	fmt.Printf("create a new HTTP transport for TCP connection %d\n", fd)
 	st := s.newHTTP2Transport(rawConn, false)
 	rawConn.SetDeadline(time.Time{})
 	if st == nil {
@@ -1040,7 +1045,7 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 
 	// Rui: store the accepted TCP connection in the map of the server.
 	tcpAddr := rawConn.RemoteAddr().(*net.TCPAddr)
-	key := ConnKey(fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port))
+	key := string(fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port))
 	s.connMap.Store(key, st)
 
 	if cc, ok := rawConn.(interface {
@@ -1083,6 +1088,9 @@ func (s *Server) newHTTP2Transport(c net.Conn, ifkoma bool) transport.ServerTran
 		BufferPool:            s.opts.bufferPool,
 	}
 	st, err := transport.NewServerTransport(c, config, ifkoma)
+	if ifkoma {
+		fmt.Printf("create koma http transport %+v %v\n", st, err)
+	}
 	if err != nil {
 		s.mu.Lock()
 		s.errorf("NewServerTransport(%q) failed: %v", c.RemoteAddr(), err)
@@ -1098,7 +1106,9 @@ func (s *Server) newHTTP2Transport(c net.Conn, ifkoma bool) transport.ServerTran
 		}
 		return nil
 	}
-
+	if ifkoma {
+		fmt.Printf("here %+v %v\n", st, err)
+	}
 	return st
 }
 
