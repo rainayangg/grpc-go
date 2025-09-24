@@ -668,7 +668,6 @@ func (s *Server) serverWorker() {
 	fmt.Printf("create a new HTTP transport for KOMA socket %d\n", komafd)
 	ctx := transport.SetConnection(context.Background(), komaConn)
 
-	fmt.Printf("create context for peer %d %+v\n", komafd, st)
 	ctx = peer.NewContext(ctx, st.Peer())
 
 	for _, sh := range s.opts.statsHandlers {
@@ -682,13 +681,15 @@ func (s *Server) serverWorker() {
 		}
 	}()
 
-	streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
+	// streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
 	st.HandleStreamsKoma(ctx, &s.connMap, int(komafd), func(stream *transport.ServerStream) {
-		s.handlersWG.Add(1)
-		streamQuota.acquire()
-		defer streamQuota.release()
-		defer s.handlersWG.Done()
+		fmt.Printf("HandleStreamsKoma: start handling stream!!!\n")
+		// s.handlersWG.Add(1)
+		// streamQuota.acquire()
+		// defer streamQuota.release()
+		// defer s.handlersWG.Done()
 		s.handleStream(st, stream)
+		fmt.Printf("HandleStreamsKoma: finish handling stream!!!\n")
 	})
 }
 
@@ -1088,9 +1089,9 @@ func (s *Server) newHTTP2Transport(c net.Conn, ifkoma bool) transport.ServerTran
 		BufferPool:            s.opts.bufferPool,
 	}
 	st, err := transport.NewServerTransport(c, config, ifkoma)
-	if ifkoma {
-		fmt.Printf("create koma http transport %+v %v\n", st, err)
-	}
+	//if ifkoma {
+	//fmt.Printf("create koma http transport %+v %v\n", st, err)
+	//}
 	if err != nil {
 		s.mu.Lock()
 		s.errorf("NewServerTransport(%q) failed: %v", c.RemoteAddr(), err)
@@ -1106,9 +1107,9 @@ func (s *Server) newHTTP2Transport(c net.Conn, ifkoma bool) transport.ServerTran
 		}
 		return nil
 	}
-	if ifkoma {
-		fmt.Printf("here %+v %v\n", st, err)
-	}
+	//if ifkoma {
+	//fmt.Printf("here %+v %v\n", st, err)
+	//}
 	return st
 }
 

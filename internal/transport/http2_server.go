@@ -359,12 +359,12 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		fmt.Printf("Koma socket receives the initial settings frame!\n")
 
 		// print map
-		fmt.Printf("print map!\n")
-		kconn.GetMap().Range(func(key, value any) bool {
-			fmt.Printf("key=%v, value=%v\n", key, value)
-			fmt.Println(kconn.RemoteAddr().String() == key)
-			return true // keep iterating
-		})
+		//fmt.Printf("print map!\n")
+		//kconn.GetMap().Range(func(key, value any) bool {
+		//fmt.Printf("key=%v, value=%v\n", key, value)
+		//fmt.Println(kconn.RemoteAddr().String() == key)
+		//return true // keep iterating
+		//})
 		remoteAddr := kconn.RemoteAddr().String()
 		val, ok := kconn.GetMap().Load(remoteAddr)
 		if !ok {
@@ -775,7 +775,10 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		koma.KomaPull(komafd)
 
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
+		fmt.Printf("HandleStreamsKoma: start Reading frames\n")
 		frames, err := t.framer.komafr.ReadFrames()
+		fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
+		fmt.Printf("%+v\n", frames)
 
 		// Rui: lookup the connMap to locate the st for the tcp connection
 		remoteAddr := t.framer.komafr.KomaSocket.RemoteAddr().String()
@@ -785,6 +788,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 			return
 		}
 		tcpSt := val.(*http2Server)
+		fmt.Printf("HandleStreamsKoma: Get associated TCP connection\n")
 
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		if err != nil {
@@ -807,10 +811,14 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		}
 
 		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
+		fmt.Printf("HandleStreamsKoma: start processing frames\n")
 		var stream *ServerStream
+		var ifNewStream bool
 		for _, frame := range frames {
 			switch frame := frame.(type) {
 			case *http2.MetaHeadersFrame:
+				ifNewStream = true
+				fmt.Printf("HandleStreamsKoma: !MetaHeadersFrame\n")
 				s, err := tcpSt.operateHeaders(ctx, frame, func(*ServerStream) {})
 				if err != nil {
 					// Any error processing client headers, e.g. invalid stream ID,
@@ -824,14 +832,19 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				}
 				stream = s
 			case *http2.DataFrame:
+				fmt.Printf("HandleStreamsKoma: !DataFrame\n")
 				tcpSt.handleData(frame)
 			case *http2.RSTStreamFrame:
+				fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
 				tcpSt.handleRSTStream(frame)
 			case *http2.SettingsFrame:
+				fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
 				tcpSt.handleSettings(frame)
 			case *http2.PingFrame:
+				fmt.Printf("HandleStreamsKoma: !PingFrame\n")
 				tcpSt.handlePing(frame)
 			case *http2.WindowUpdateFrame:
+				fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
 				tcpSt.handleWindowUpdate(frame)
 			case *http2.GoAwayFrame:
 				// TODO: Handle GoAway from the client appropriately.
@@ -847,7 +860,10 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		// In the original gRPC setting, whenever a new stream is detected (from `MetaHeaderFrame`), the handle function
 		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
 		// the associated stream (which involves blocking and waiting), ii) assign a go-routine worker to do the associated work.
-		handle(stream)
+		if ifNewStream {
+			fmt.Printf("HandleStreamsKoma: start handling stream\n")
+			handle(stream)
+		}
 
 	}
 }
@@ -1602,7 +1618,6 @@ func (t *http2Server) getOutFlowWindow() int64 {
 
 // Peer returns the peer of the transport.
 func (t *http2Server) Peer() *peer.Peer {
-	fmt.Printf("enter Peer fuc!\n")
 	return &peer.Peer{
 		Addr:      t.peer.Addr,
 		LocalAddr: t.peer.LocalAddr,
