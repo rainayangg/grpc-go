@@ -64,13 +64,12 @@ int koma_init(void) {
   return komafd;
 }
 
-int koma_attach(int komafd, int csock, int bpf_prog_fd) {
+int koma_attach(int komafd, int csock) {
   int error;
   struct kcm_attach attach_info;
 
   memset(&attach_info, 0, sizeof(attach_info));
   attach_info.fd = csock;
-  attach_info.bpf_fd = bpf_prog_fd;
 
   error = ioctl(komafd, SIOCKOMAATTACH, &attach_info);
 

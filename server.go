@@ -152,7 +152,6 @@ type Server struct {
 
 	serverWorkerChannel      chan func()
 	serverWorkerChannelClose func()
-	bpf_progfd               int // the fd for the bpf program to be attached to koma socket.
 	// TODO(Rui): grpc-koma does not need ebpf program anyway, to be removed after the bpf part is removed in the koma code
 	komafds []int // all koma sockets belonging to this server
 
@@ -959,8 +958,6 @@ func (s *Server) Serve(lis net.Listener) error {
 
 	// Rui: initialize the bpf program
 	// TODO(Rui): check if its done correctly
-	s.bpf_progfd = koma.BpfInit("memcache-id")
-	fmt.Printf("BPF program initialized %d\n", s.bpf_progfd)
 
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
@@ -970,7 +967,7 @@ func (s *Server) Serve(lis net.Listener) error {
 			fmt.Printf("failed to get new TCP connection fd")
 		}
 
-		ierr := koma.KomaAttach(s.komafds[0], fd, s.bpf_progfd)
+		ierr := koma.KomaAttach(s.komafds[0], fd)
 		if ierr == -1 {
 			fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
 		}

@@ -23,10 +23,9 @@
 #define SIOCKOMAPULL (SIOCPROTOPRIVATE + 3)
 #endif
 
-int bpf_init(const char*);
+int bpf_init(const char *);
 int koma_init(void);
-int koma_attach(int komafd, int csock, int bpf_prog_fd);
+int koma_attach(int komafd, int csock);
 int koma_pull(int komafd);
 
 #endif /* COMMON_KOMA_H */
-
