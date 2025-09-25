@@ -962,17 +962,6 @@ func (s *Server) Serve(lis net.Listener) error {
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
 		rawConn, err := lis.Accept()
-		fd, ferr := GetFdFromTCPConn(rawConn)
-		if ferr != nil {
-			fmt.Printf("failed to get new TCP connection fd")
-		}
-
-		ierr := koma.KomaAttach(s.komafds[0], fd)
-		if ierr == -1 {
-			fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
-		}
-		fmt.Printf("Accept new TCP connection, attach to KOMA\n")
-
 		if err != nil {
 			if ne, ok := err.(interface {
 				Temporary() bool
@@ -1036,6 +1025,17 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	fd, _ := GetFdFromTCPConn(rawConn)
 	fmt.Printf("create a new HTTP transport for TCP connection %d\n", fd)
 	st := s.newHTTP2Transport(rawConn, false)
+	fd, ferr := GetFdFromTCPConn(rawConn)
+	if ferr != nil {
+		fmt.Printf("failed to get new TCP connection fd")
+	}
+
+	ierr := koma.KomaAttach(s.komafds[0], fd)
+	if ierr == -1 {
+		fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
+	}
+	fmt.Printf("Accept new TCP connection, attach to KOMA\n")
+
 	rawConn.SetDeadline(time.Time{})
 	if st == nil {
 		return
