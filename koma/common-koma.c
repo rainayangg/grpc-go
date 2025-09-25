@@ -70,6 +70,7 @@ int koma_attach(int komafd, int csock) {
 
   memset(&attach_info, 0, sizeof(attach_info));
   attach_info.fd = csock;
+  attach_info.bpf_fd = -1;
 
   error = ioctl(komafd, SIOCKOMAATTACH, &attach_info);
 
