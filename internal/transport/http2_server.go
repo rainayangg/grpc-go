@@ -428,11 +428,13 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		return nil, nil
 	}
 
-	if streamID%2 != 1 || streamID <= t.maxStreamID {
-		// illegal gRPC stream id.
-		return nil, fmt.Errorf("received an illegal stream id: %v. headers frame: %+v", streamID, frame)
+	// if streamID%2 != 1 || streamID <= t.maxStreamID {
+	// 	// illegal gRPC stream id.
+	// 	return nil, fmt.Errorf("received an illegal stream id: %v. headers frame: %+v", streamID, frame)
+	// }
+	if streamID > t.maxStreamID {
+		t.maxStreamID = streamID
 	}
-	t.maxStreamID = streamID
 
 	buf := newRecvBuffer()
 	s := &ServerStream{
