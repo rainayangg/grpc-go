@@ -311,7 +311,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 			}
 		}()
 		// Rui: In koma socket, check the validity of client preface.
-		fmt.Printf("Koma socket checks preface!\n")
+		// fmt.Printf("Koma socket checks preface!\n")
 		preface := make([]byte, len(clientPreface))
 		if _, err := io.ReadFull(t.conn, preface); err != nil {
 			// In deployments where a gRPC server runs behind a cloud load balancer
@@ -327,7 +327,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		if !bytes.Equal(preface, clientPreface) {
 			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
 		}
-		fmt.Printf("Koma socket receives preface from the client!\n")
+		// fmt.Printf("Koma socket receives preface from the client!\n")
 
 		// Rui: only use here temporarily to read one single frame
 		//kconn, kok := conn.(*http2.KomaConn)
@@ -340,7 +340,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 
 		// need to call koma_pull first
 		frame, err := t.framer.fr.ReadFrame()
-		fmt.Printf("Koma socket receives first frame after preface!\n")
+		// fmt.Printf("Koma socket receives first frame after preface!\n")
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			fmt.Printf("Koma socket fails to read initial settings frame 1\n")
 			return nil, err
@@ -355,10 +355,10 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 			fmt.Printf("Koma socket fails to read initial settings frame 3\n")
 			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
 		}
-		fmt.Printf("Koma socket receives the initial settings frame!\n")
+		// fmt.Printf("Koma socket receives the initial settings frame!\n")
 
 		// print map
-		fmt.Printf("print map!\n")
+		// fmt.Printf("print map!\n")
 		//kconn.GetMap().Range(func(key, value any) bool {
 		//fmt.Printf("key=%v, value=%v\n", key, value)
 		//fmt.Println(kconn.RemoteAddr().String() == key)
@@ -371,7 +371,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		//return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams cannot find the associated TCP connection tor respond")
 		//}
 		//tcpSt := val.(*http2Server)
-		fmt.Printf("Koma socket to send the settings ack\n")
+		// fmt.Printf("Koma socket to send the settings ack\n")
 		t.handleSettings(sf)
 
 	}
@@ -776,10 +776,10 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		koma.KomaPull(komafd)
 
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
-		fmt.Printf("HandleStreamsKoma: start Reading frames\n")
+		// fmt.Printf("HandleStreamsKoma: start Reading frames\n")
 		frames, err := t.framer.komafr.ReadFrames()
-		fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
-		fmt.Printf("%+v\n", frames)
+		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
+		// fmt.Printf("%+v\n", frames)
 
 		// Rui: lookup the connMap to locate the st for the tcp connection
 		remoteAddr := t.framer.komafr.KomaSocket.RemoteAddr().String()
@@ -789,7 +789,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 			return
 		}
 		tcpSt := val.(*http2Server)
-		fmt.Printf("HandleStreamsKoma: Get associated TCP connection\n")
+		// fmt.Printf("HandleStreamsKoma: Get associated TCP connection\n")
 
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		if err != nil {
@@ -812,14 +812,14 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		}
 
 		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
-		fmt.Printf("HandleStreamsKoma: start processing frames\n")
+		// fmt.Printf("HandleStreamsKoma: start processing frames\n")
 		var stream *ServerStream
 		var ifNewStream bool
 		for _, frame := range frames {
 			switch frame := frame.(type) {
 			case *http2.MetaHeadersFrame:
 				ifNewStream = true
-				fmt.Printf("HandleStreamsKoma: !MetaHeadersFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !MetaHeadersFrame\n")
 				s, err := tcpSt.operateHeaders(ctx, frame, func(*ServerStream) {})
 				if err != nil {
 					// Any error processing client headers, e.g. invalid stream ID,
@@ -833,19 +833,19 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				}
 				stream = s
 			case *http2.DataFrame:
-				fmt.Printf("HandleStreamsKoma: !DataFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
 				tcpSt.handleData(frame)
 			case *http2.RSTStreamFrame:
-				fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
 				tcpSt.handleRSTStream(frame)
 			case *http2.SettingsFrame:
-				fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
 				tcpSt.handleSettings(frame)
 			case *http2.PingFrame:
-				fmt.Printf("HandleStreamsKoma: !PingFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !PingFrame\n")
 				tcpSt.handlePing(frame)
 			case *http2.WindowUpdateFrame:
-				fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
 				tcpSt.handleWindowUpdate(frame)
 			case *http2.GoAwayFrame:
 				// TODO: Handle GoAway from the client appropriately.
@@ -862,7 +862,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
 		// the associated stream (which involves blocking and waiting), ii) assign a go-routine worker to do the associated work.
 		if ifNewStream {
-			fmt.Printf("HandleStreamsKoma: start handling stream\n")
+			// fmt.Printf("HandleStreamsKoma: start handling stream\n")
 			handle(stream)
 		}
 

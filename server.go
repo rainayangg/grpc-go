@@ -682,13 +682,13 @@ func (s *Server) serverWorker() {
 
 	// streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
 	st.HandleStreamsKoma(ctx, &s.connMap, int(komafd), func(stream *transport.ServerStream) {
-		fmt.Printf("HandleStreamsKoma: start handling stream!!!\n")
+		// fmt.Printf("HandleStreamsKoma: start handling stream!!!\n")
 		// s.handlersWG.Add(1)
 		// streamQuota.acquire()
 		// defer streamQuota.release()
 		// defer s.handlersWG.Done()
 		s.handleStream(st, stream)
-		fmt.Printf("HandleStreamsKoma: finish handling stream!!!\n")
+		// fmt.Printf("HandleStreamsKoma: finish handling stream!!!\n")
 	})
 }
 
