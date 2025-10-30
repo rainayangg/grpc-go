@@ -92,7 +92,7 @@ func (f *trInFlow) newLimit(n uint32) uint32 {
 
 func (f *trInFlow) onData(n uint32) uint32 {
 	f.unacked += n
-	fmt.Printf("trInFlow.onData: unacked=%d, limit=%d\n", f.unacked, f.limit)
+	// fmt.Printf("trInFlow.onData: unacked=%d, limit=%d\n", f.unacked, f.limit)
 	if f.unacked < f.limit/4 {
 		f.updateEffectiveWindowSize()
 		return 0

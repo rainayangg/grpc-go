@@ -773,19 +773,19 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		// t.controlBuf.throttle()
 
 		// Rui: komaPull which tries to pull a message from the in-kernel central queue.
-		fmt.Printf("HandleStreamsKoma: start koma pull\n")
+		// fmt.Printf("HandleStreamsKoma: start koma pull\n")
 		koma.KomaPull(komafd)
 
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
-		fmt.Printf("HandleStreamsKoma: start Reading frames\n")
+		// fmt.Printf("HandleStreamsKoma: start Reading frames\n")
 		frames, err := t.framer.komafr.ReadFrames()
-		fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
-		fmt.Printf("%+v\n", frames)
+		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
+		// fmt.Printf("%+v\n", frames)
 
-		// if (frames == nil || len(frames) == 0) && err == nil {
-		// 	fmt.Printf("HandleStreamsKoma: no frames read, continue\n")
-		// 	continue
-		// }
+		if (frames == nil || len(frames) == 0) {
+			// fmt.Printf("HandleStreamsKoma: no frames read, continue\n")
+			continue
+		}
 
 		// Rui: lookup the connMap to locate the st for the tcp connection
 		remoteAddr := t.framer.komafr.KomaSocket.RemoteAddr().String()
@@ -795,7 +795,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 			return
 		}
 		tcpSt := val.(*http2Server)
-		fmt.Printf("HandleStreamsKoma: Get associated TCP connection\n")
+		// fmt.Printf("HandleStreamsKoma: Get associated TCP connection\n")
 
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		if err != nil {
@@ -819,14 +819,14 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		}
 
 		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
-		fmt.Printf("HandleStreamsKoma: start processing frames\n")
+		// fmt.Printf("HandleStreamsKoma: start processing frames\n")
 		var stream *ServerStream
 		var ifNewStream bool
 		for _, frame := range frames {
 			switch frame := frame.(type) {
 			case *http2.MetaHeadersFrame:
 				ifNewStream = true
-				fmt.Printf("HandleStreamsKoma: !MetaHeadersFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !MetaHeadersFrame\n")
 				s, err := tcpSt.operateHeaders(ctx, frame, func(*ServerStream) {})
 				if err != nil {
 					// Any error processing client headers, e.g. invalid stream ID,
@@ -840,19 +840,19 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				}
 				stream = s
 			case *http2.DataFrame:
-				fmt.Printf("HandleStreamsKoma: !DataFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
 				tcpSt.handleData(frame)
 			case *http2.RSTStreamFrame:
-				fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
 				tcpSt.handleRSTStream(frame)
 			case *http2.SettingsFrame:
-				fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
 				tcpSt.handleSettings(frame)
 			case *http2.PingFrame:
-				fmt.Printf("HandleStreamsKoma: !PingFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !PingFrame\n")
 				tcpSt.handlePing(frame)
 			case *http2.WindowUpdateFrame:
-				fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
 				tcpSt.handleWindowUpdate(frame)
 			case *http2.GoAwayFrame:
 				// TODO: Handle GoAway from the client appropriately.
@@ -951,7 +951,7 @@ func (t *http2Server) handleData(f *http2.DataFrame) {
 	// active(fast) streams from starving in presence of slow or
 	// inactive streams.
 	if w := t.fc.onData(size); w > 0 {
-		fmt.Printf("http2_server.go: handleData: send connection-level window update of %d\n", w)
+		// fmt.Printf("http2_server.go: handleData: send connection-level window update of %d\n", w)
 		t.controlBuf.put(&outgoingWindowUpdate{
 			streamID:  0,
 			increment: w,
