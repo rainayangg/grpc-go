@@ -782,7 +782,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
 		// fmt.Printf("%+v\n", frames)
 
-		if (frames == nil || len(frames) == 0) {
+		if frames == nil || len(frames) == 0 {
 			// fmt.Printf("HandleStreamsKoma: no frames read, continue\n")
 			continue
 		}
