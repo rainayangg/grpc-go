@@ -55,6 +55,7 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
+	"google.golang.org/grpc/timetrace"
 )
 
 const (
@@ -930,7 +931,7 @@ func (s *Server) Serve(lis net.Listener) error {
 			<-s.done.Done()
 		}
 	}()
-
+	timetrace.Record0("grpc.server.serve")
 	ls := &listenSocket{
 		Listener: lis,
 		channelz: channelz.RegisterSocket(&channelz.Socket{

@@ -42,6 +42,7 @@ import (
 	istatus "google.golang.org/grpc/internal/status"
 	"google.golang.org/grpc/internal/syscall"
 	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/timetrace"
 	"google.golang.org/protobuf/proto"
 
 	"google.golang.org/grpc/codes"
@@ -778,6 +779,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
 		// fmt.Printf("HandleStreamsKoma: start Reading frames\n")
+		timetrace.Record1("HandleStreamsKoma: before ReadFrames %d is", 1)
 		frames, err := t.framer.komafr.ReadFrames()
 		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
 		// fmt.Printf("%+v\n", frames)

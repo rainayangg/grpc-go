@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,7 +35,7 @@ func CalBootTime() (int64, error) {
 
 func DefaultOptions() Options {
 	return Options{
-		NumShards:    runtime.GOMAXPROCS(0) * 4, //4*a shards (a being the max number of cores we use)
+		NumShards:    runtime.GOMAXPROCS(0) * 4,
 		BufSizeExp:   16,
 		AutoDumpPath: "/root/grpc-go/timetrace/dump.log",
 	}
@@ -44,6 +45,7 @@ type event struct {
 	ts             int64
 	format         string
 	a0, a1, a2, a3 uint32
+	argc           uint8
 	used           uint32
 }
 
@@ -60,15 +62,17 @@ type shard struct {
 
 var (
 	global struct {
-		ok     atomic.Bool
-		shards []shard
-		dumpMu sync.Mutex
+		ok       atomic.Bool
+		shards   []shard
+		dumpMu   sync.Mutex
+		dumpPath string
 	}
 )
 
-func Init(opts Options) {
+func Init() {
+	opts := DefaultOptions()
 	if global.ok.Load() {
-		return // return if already initialized
+		return
 	}
 	var err error
 	BootTime, err = CalBootTime()
@@ -79,6 +83,7 @@ func Init(opts Options) {
 	if opts.NumShards <= 0 {
 		opts.NumShards = runtime.GOMAXPROCS(0) * 4
 	}
+	fmt.Printf("timetrace: NumShards is: %d\n", opts.NumShards)
 	n := 1
 	for n < opts.NumShards {
 		n <<= 1
@@ -90,6 +95,7 @@ func Init(opts Options) {
 	size := 1 << opts.BufSizeExp
 
 	global.shards = make([]shard, opts.NumShards)
+	global.dumpPath = opts.AutoDumpPath
 	for i := range global.shards {
 		global.shards[i] = shard{
 			r: ring{
@@ -104,28 +110,29 @@ func Init(opts Options) {
 
 func nowNS() int64 { return time.Now().UnixNano() - BootTime }
 
-func Record0(format string)                        { rec(format, 0, 0, 0, 0) }
-func Record1(format string, a0 uint32)             { rec(format, a0, 0, 0, 0) }
-func Record2(format string, a0, a1 uint32)         { rec(format, a0, a1, 0, 0) }
-func Record3(format string, a0, a1, a2 uint32)     { rec(format, a0, a1, a2, 0) }
-func Record4(format string, a0, a1, a2, a3 uint32) { rec(format, a0, a1, a2, a3) }
+func Record0(format string)                        { recN(format, 0, 0, 0, 0, 0) }
+func Record1(format string, a0 uint32)             { recN(format, 1, a0, 0, 0, 0) }
+func Record2(format string, a0, a1 uint32)         { recN(format, 2, a0, a1, 0, 0) }
+func Record3(format string, a0, a1, a2 uint32)     { recN(format, 3, a0, a1, a2, 0) }
+func Record4(format string, a0, a1, a2, a3 uint32) { recN(format, 4, a0, a1, a2, a3) }
 
-func rec(format string, a0, a1, a2, a3 uint32) {
+func recN(format string, argc uint8, a0, a1, a2, a3 uint32) {
 	if !global.ok.Load() {
 		return
 	}
 	s := &global.shards[unix.Gettid()&(len(global.shards)-1)]
 	i := s.r.next
-	s.r.next += 1
+	s.r.next++
 	idx := i & s.r.mask
 	ev := &s.r.events[idx]
 	ev.ts = nowNS()
 	ev.format = format
 	ev.a0, ev.a1, ev.a2, ev.a3 = a0, a1, a2, a3
+	ev.argc = argc
 	atomic.StoreUint32(&ev.used, 1)
 }
 
-func DumpToFile(path string) error {
+func DumpToFile() error {
 	if !global.ok.Load() {
 		return fmt.Errorf("timetrace not initialized")
 	}
@@ -134,7 +141,7 @@ func DumpToFile(path string) error {
 
 	global.ok.Store(false)
 
-	f, err := os.Create(path)
+	f, err := os.Create(global.dumpPath)
 	if err != nil {
 		return err
 	}
@@ -153,8 +160,23 @@ func DumpToFile(path string) error {
 			if atomic.LoadUint32(&ev.used) == 0 || ev.ts == 0 {
 				continue
 			}
-			line := fmt.Sprintf("%d [C%02d] ", ev.ts, sid) +
-				fmt.Sprintf(ev.format, ev.a0, ev.a1, ev.a2, ev.a3)
+
+			txt := ev.format
+			// Only format if there are verbs and args.
+			if ev.argc > 0 && strings.Contains(ev.format, "%") {
+				switch ev.argc {
+				case 1:
+					txt = fmt.Sprintf(ev.format, ev.a0)
+				case 2:
+					txt = fmt.Sprintf(ev.format, ev.a0, ev.a1)
+				case 3:
+					txt = fmt.Sprintf(ev.format, ev.a0, ev.a1, ev.a2)
+				case 4:
+					txt = fmt.Sprintf(ev.format, ev.a0, ev.a1, ev.a2, ev.a3)
+				}
+			}
+
+			line := fmt.Sprintf("%d [C%02d] %s", ev.ts, sid, txt)
 			rows = append(rows, row{ts: ev.ts, text: line})
 		}
 	}
@@ -168,4 +190,4 @@ func DumpToFile(path string) error {
 	return nil
 }
 
-func Freeze(path string) error { return DumpToFile(path) }
+func Freeze() error { return DumpToFile() }
