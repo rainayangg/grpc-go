@@ -1462,6 +1462,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 		defer payInfo.free()
 	}
 
+	timetrace.Record1("%d recvAndDecompress", stream.Mark)
 	d, err := recvAndDecompress(&parser{r: stream, bufferPool: s.opts.bufferPool}, stream, dc, s.opts.maxReceiveMessageSize, payInfo, decomp, true)
 	if err != nil {
 		if e := stream.WriteStatus(status.Convert(err)); e != nil {
@@ -1553,6 +1554,8 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 	if stream.SendCompress() != sendCompressorName {
 		comp = encoding.GetCompressor(stream.SendCompress())
 	}
+
+	timetrace.Record1("%d to send response", stream.Mark)
 	if err := s.sendResponse(ctx, stream, reply, cp, opts, comp); err != nil {
 		if err == io.EOF {
 			// The entire stream is done (for unary RPC only).

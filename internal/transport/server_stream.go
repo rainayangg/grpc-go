@@ -44,6 +44,7 @@ type ServerStream struct {
 	// client.
 	clientAdvertisedCompressors string
 	headerWireLength            int
+	Mark                        uint32
 
 	// hdrMu protects outgoing header and trailer metadata.
 	hdrMu      sync.Mutex

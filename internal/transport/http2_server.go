@@ -779,8 +779,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
 		// fmt.Printf("HandleStreamsKoma: start Reading frames\n")
-		timetrace.Record1("HandleStreamsKoma: before ReadFrames %d is", 1)
 		frames, err := t.framer.komafr.ReadFrames()
+		timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
 		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
 		// fmt.Printf("%+v\n", frames)
 
@@ -841,6 +841,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 					continue
 				}
 				stream = s
+				stream.Mark = t.framer.komafr.GetMark()
 			case *http2.DataFrame:
 				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
 				tcpSt.handleData(frame)

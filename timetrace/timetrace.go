@@ -37,7 +37,7 @@ func DefaultOptions() Options {
 	return Options{
 		NumShards:    runtime.GOMAXPROCS(0) * 4,
 		BufSizeExp:   16,
-		AutoDumpPath: "/root/grpc-go/timetrace/dump.log",
+		AutoDumpPath: "/root/koma/timetrace/grpc-dump.log",
 	}
 }
 
