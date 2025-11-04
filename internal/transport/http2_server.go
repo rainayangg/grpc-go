@@ -408,6 +408,294 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 	return t, nil
 }
 
+// operateHeadersKoma takes action on the decoded headers. Returns an error if fatal
+// error encountered and transport needs to close, otherwise returns nil.
+func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame, tst *http2Server) (*ServerStream, error) {
+	// Acquire max stream ID lock for entire duration
+	tst.maxStreamMu.Lock()
+	defer tst.maxStreamMu.Unlock()
+
+	streamID := frame.Header().StreamID
+
+	// frame.Truncated is set to true when framer detects that the current header
+	// list size hits MaxHeaderListSize limit.
+	if frame.Truncated {
+		tst.controlBuf.put(&cleanupStream{
+			streamID: streamID,
+			rst:      true,
+			rstCode:  http2.ErrCodeFrameSize,
+			onWrite:  func() {},
+		})
+		return nil, nil
+	}
+
+	// if streamID%2 != 1 || streamID <= t.maxStreamID {
+	// 	// illegal gRPC stream id.
+	// 	return nil, fmt.Errorf("received an illegal stream id: %v. headers frame: %+v", streamID, frame)
+	// }
+	if streamID > tst.maxStreamID {
+		tst.maxStreamID = streamID
+	}
+
+	buf := newRecvBuffer()
+	s := &ServerStream{
+		Stream: &Stream{
+			id:  streamID,
+			buf: buf,
+			fc:  &inFlow{limit: uint32(tst.initialWindowSize)},
+		},
+		st:               tst,
+		headerWireLength: int(frame.Header().Length),
+	}
+	var (
+		// if false, content-type was missing or invalid
+		isGRPC      = false
+		contentType = ""
+		mdata       = make(metadata.MD, len(frame.Fields))
+		httpMethod  string
+		// these are set if an error is encountered while parsing the headers
+		protocolError bool
+		headerError   *status.Status
+
+		timeoutSet bool
+		timeout    time.Duration
+	)
+
+	for _, hf := range frame.Fields {
+		switch hf.Name {
+		case "content-type":
+			contentSubtype, validContentType := grpcutil.ContentSubtype(hf.Value)
+			if !validContentType {
+				contentType = hf.Value
+				break
+			}
+			mdata[hf.Name] = append(mdata[hf.Name], hf.Value)
+			s.contentSubtype = contentSubtype
+			isGRPC = true
+
+		case "grpc-accept-encoding":
+			mdata[hf.Name] = append(mdata[hf.Name], hf.Value)
+			if hf.Value == "" {
+				continue
+			}
+			compressors := hf.Value
+			if s.clientAdvertisedCompressors != "" {
+				compressors = s.clientAdvertisedCompressors + "," + compressors
+			}
+			s.clientAdvertisedCompressors = compressors
+		case "grpc-encoding":
+			s.recvCompress = hf.Value
+		case ":method":
+			httpMethod = hf.Value
+		case ":path":
+			s.method = hf.Value
+		case "grpc-timeout":
+			timeoutSet = true
+			var err error
+			if timeout, err = decodeTimeout(hf.Value); err != nil {
+				headerError = status.Newf(codes.Internal, "malformed grpc-timeout: %v", err)
+			}
+		// "Transports must consider requests containing the Connection header
+		// as malformed." - A41
+		case "connection":
+			if tst.logger.V(logLevel) {
+				tst.logger.Infof("Received a HEADERS frame with a :connection header which makes the request malformed, as per the HTTP/2 spec")
+			}
+			protocolError = true
+		default:
+			if isReservedHeader(hf.Name) && !isWhitelistedHeader(hf.Name) {
+				break
+			}
+			v, err := decodeMetadataHeader(hf.Name, hf.Value)
+			if err != nil {
+				headerError = status.Newf(codes.Internal, "malformed binary metadata %q in header %q: %v", hf.Value, hf.Name, err)
+				tst.logger.Warningf("Failed to decode metadata header (%q, %q): %v", hf.Name, hf.Value, err)
+				break
+			}
+			mdata[hf.Name] = append(mdata[hf.Name], v)
+		}
+	}
+
+	// "If multiple Host headers or multiple :authority headers are present, the
+	// request must be rejected with an HTTP status code 400 as required by Host
+	// validation in RFC 7230 §5.4, gRPC status code INTERNAL, or RST_STREAM
+	// with HTTP/2 error code PROTOCOL_ERROR." - A41. Since this is a HTTP/2
+	// error, this takes precedence over a client not speaking gRPC.
+	if len(mdata[":authority"]) > 1 || len(mdata["host"]) > 1 {
+		errMsg := fmt.Sprintf("num values of :authority: %v, num values of host: %v, both must only have 1 value as per HTTP/2 spec", len(mdata[":authority"]), len(mdata["host"]))
+		if tst.logger.V(logLevel) {
+			tst.logger.Infof("Aborting the stream early: %v", errMsg)
+		}
+		tst.controlBuf.put(&earlyAbortStream{
+			httpStatus:     http.StatusBadRequest,
+			streamID:       streamID,
+			contentSubtype: s.contentSubtype,
+			status:         status.New(codes.Internal, errMsg),
+			rst:            !frame.StreamEnded(),
+		})
+		return s, nil
+	}
+
+	if protocolError {
+		tst.controlBuf.put(&cleanupStream{
+			streamID: streamID,
+			rst:      true,
+			rstCode:  http2.ErrCodeProtocol,
+			onWrite:  func() {},
+		})
+		return s, nil
+	}
+	if !isGRPC {
+		tst.controlBuf.put(&earlyAbortStream{
+			httpStatus:     http.StatusUnsupportedMediaType,
+			streamID:       streamID,
+			contentSubtype: s.contentSubtype,
+			status:         status.Newf(codes.InvalidArgument, "invalid gRPC request content-type %q", contentType),
+			rst:            !frame.StreamEnded(),
+		})
+		return s, nil
+	}
+	if headerError != nil {
+		tst.controlBuf.put(&earlyAbortStream{
+			httpStatus:     http.StatusBadRequest,
+			streamID:       streamID,
+			contentSubtype: s.contentSubtype,
+			status:         headerError,
+			rst:            !frame.StreamEnded(),
+		})
+		return s, nil
+	}
+
+	// "If :authority is missing, Host must be renamed to :authority." - A41
+	if len(mdata[":authority"]) == 0 {
+		// No-op if host isn't present, no eventual :authority header is a valid
+		// RPC.
+		if host, ok := mdata["host"]; ok {
+			mdata[":authority"] = host
+			delete(mdata, "host")
+		}
+	} else {
+		// "If :authority is present, Host must be discarded" - A41
+		delete(mdata, "host")
+	}
+
+	if frame.StreamEnded() {
+		// s is just created by the caller. No lock needed.
+		s.state = streamReadDone
+	}
+	if timeoutSet {
+		s.ctx, s.cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		s.ctx, s.cancel = context.WithCancel(ctx)
+	}
+
+	// Attach the received metadata to the context.
+	if len(mdata) > 0 {
+		s.ctx = metadata.NewIncomingContext(s.ctx, mdata)
+	}
+	tst.mu.Lock()
+	if tst.state != reachable {
+		tst.mu.Unlock()
+		s.cancel()
+		return s, nil
+	}
+	if uint32(len(tst.activeStreams)) >= tst.maxStreams {
+		tst.mu.Unlock()
+		tst.controlBuf.put(&cleanupStream{
+			streamID: streamID,
+			rst:      true,
+			rstCode:  http2.ErrCodeRefusedStream,
+			onWrite:  func() {},
+		})
+		s.cancel()
+		return s, nil
+	}
+	if httpMethod != http.MethodPost {
+		tst.mu.Unlock()
+		errMsg := fmt.Sprintf("Received a HEADERS frame with :method %q which should be POST", httpMethod)
+		if tst.logger.V(logLevel) {
+			tst.logger.Infof("Aborting the stream early: %v", errMsg)
+		}
+		tst.controlBuf.put(&earlyAbortStream{
+			httpStatus:     http.StatusMethodNotAllowed,
+			streamID:       streamID,
+			contentSubtype: s.contentSubtype,
+			status:         status.New(codes.Internal, errMsg),
+			rst:            !frame.StreamEnded(),
+		})
+		s.cancel()
+		return s, nil
+	}
+	if tst.inTapHandle != nil {
+		var err error
+		if s.ctx, err = tst.inTapHandle(s.ctx, &tap.Info{FullMethodName: s.method, Header: mdata}); err != nil {
+			tst.mu.Unlock()
+			if tst.logger.V(logLevel) {
+				tst.logger.Infof("Aborting the stream early due to InTapHandle failure: %v", err)
+			}
+			stat, ok := status.FromError(err)
+			if !ok {
+				stat = status.New(codes.PermissionDenied, err.Error())
+			}
+			tst.controlBuf.put(&earlyAbortStream{
+				httpStatus:     http.StatusOK,
+				streamID:       s.id,
+				contentSubtype: s.contentSubtype,
+				status:         stat,
+				rst:            !frame.StreamEnded(),
+			})
+			return s, nil
+		}
+	}
+	tst.activeStreams[streamID] = s
+	if len(tst.activeStreams) == 1 {
+		tst.idle = time.Time{}
+	}
+	// Start a timer to close the stream on reaching the deadline.
+	if timeoutSet {
+		// We need to wait for s.cancel to be updated before calling
+		// t.closeStream to avoid data races.
+		cancelUpdated := make(chan struct{})
+		timer := internal.TimeAfterFunc(timeout, func() {
+			<-cancelUpdated
+			tst.closeStream(s, true, http2.ErrCodeCancel, false)
+			fmt.Printf("Koma socket stream %d timed out after %v\n", s.id, timeout)
+		})
+		oldCancel := s.cancel
+		s.cancel = func() {
+			oldCancel()
+			timer.Stop()
+		}
+		close(cancelUpdated)
+	}
+	tst.mu.Unlock()
+	if channelz.IsOn() {
+		tst.channelz.SocketMetrics.StreamsStarted.Add(1)
+		tst.channelz.SocketMetrics.LastRemoteStreamCreatedTimestamp.Store(time.Now().UnixNano())
+	}
+	s.requestRead = func(n int) {
+		tst.adjustWindow(s, uint32(n))
+	}
+	s.ctxDone = s.ctx.Done()
+	s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
+	s.trReader = &transportReader{
+		reader: &recvBufferReader{
+			ctx:     s.ctx,
+			ctxDone: s.ctxDone,
+			recv:    s.buf,
+		},
+		windowHandler: func(n int) {
+			tst.updateWindow(s, uint32(n))
+		},
+	}
+	// Register the stream with loopy.
+	tst.controlBuf.put(&registerStream{
+		streamID: s.id,
+		wq:       s.wq,
+	})
+	return s, nil
+}
+
 // operateHeaders takes action on the decoded headers. Returns an error if fatal
 // error encountered and transport needs to close, otherwise returns nil.
 func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeadersFrame, handle func(*ServerStream)) (*ServerStream, error) {
@@ -835,7 +1123,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 			case *http2.MetaHeadersFrame:
 				ifNewStream = true
 				// fmt.Printf("HandleStreamsKoma: !MetaHeadersFrame\n")
-				s, err := tcpSt.operateHeaders(ctx, frame, func(*ServerStream) {})
+				// s, err := tcpSt.operateHeaders(ctx, frame, func(*ServerStream) {})
+				s, err := t.operateHeadersKoma(ctx, frame, tcpSt)
 				if err != nil {
 					// Any error processing client headers, e.g. invalid stream ID,
 					// is considered a protocol violation.
@@ -849,19 +1138,19 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				stream = s
 				stream.Mark = t.framer.komafr.GetMark()
 			case *http2.DataFrame:
-				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
+				fmt.Printf("HandleStreamsKoma: !DataFrame\n")
 				tcpSt.handleData(frame)
 			case *http2.RSTStreamFrame:
-				// fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
+				fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
 				tcpSt.handleRSTStream(frame)
 			case *http2.SettingsFrame:
-				// fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
+				fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
 				tcpSt.handleSettings(frame)
 			case *http2.PingFrame:
-				// fmt.Printf("HandleStreamsKoma: !PingFrame\n")
+				fmt.Printf("HandleStreamsKoma: !PingFrame\n")
 				tcpSt.handlePing(frame)
 			case *http2.WindowUpdateFrame:
-				// fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
+				fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
 				tcpSt.handleWindowUpdate(frame)
 			case *http2.GoAwayFrame:
 				// TODO: Handle GoAway from the client appropriately.
