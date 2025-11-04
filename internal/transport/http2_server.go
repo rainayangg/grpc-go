@@ -412,8 +412,8 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 // error encountered and transport needs to close, otherwise returns nil.
 func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame, tst *http2Server) (*ServerStream, error) {
 	// Acquire max stream ID lock for entire duration
-	tst.maxStreamMu.Lock()
-	defer tst.maxStreamMu.Unlock()
+	// tst.maxStreamMu.Lock()
+	// defer tst.maxStreamMu.Unlock()
 
 	streamID := frame.Header().StreamID
 
@@ -433,9 +433,9 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 	// 	// illegal gRPC stream id.
 	// 	return nil, fmt.Errorf("received an illegal stream id: %v. headers frame: %+v", streamID, frame)
 	// }
-	if streamID > tst.maxStreamID {
-		tst.maxStreamID = streamID
-	}
+	// if streamID > tst.maxStreamID {
+	// tst.maxStreamID = streamID
+	// }
 
 	buf := newRecvBuffer()
 	s := &ServerStream{
@@ -1138,19 +1138,19 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				stream = s
 				stream.Mark = t.framer.komafr.GetMark()
 			case *http2.DataFrame:
-				fmt.Printf("HandleStreamsKoma: !DataFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
 				tcpSt.handleData(frame)
 			case *http2.RSTStreamFrame:
-				fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
 				tcpSt.handleRSTStream(frame)
 			case *http2.SettingsFrame:
-				fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
 				tcpSt.handleSettings(frame)
 			case *http2.PingFrame:
-				fmt.Printf("HandleStreamsKoma: !PingFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !PingFrame\n")
 				tcpSt.handlePing(frame)
 			case *http2.WindowUpdateFrame:
-				fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
+				// fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
 				tcpSt.handleWindowUpdate(frame)
 			case *http2.GoAwayFrame:
 				// TODO: Handle GoAway from the client appropriately.
