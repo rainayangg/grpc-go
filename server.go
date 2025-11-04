@@ -1026,6 +1026,12 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	fd, _ := GetFdFromTCPConn(rawConn)
 	fmt.Printf("create a new HTTP transport for TCP connection %d\n", fd)
 	st := s.newHTTP2Transport(rawConn, false)
+
+	// Rui: store the accepted TCP connection in the map of the server.
+	tcpAddr := rawConn.RemoteAddr().(*net.TCPAddr)
+	key := string(fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port))
+	s.connMap.Store(key, st)
+
 	fd, ferr := GetFdFromTCPConn(rawConn)
 	if ferr != nil {
 		fmt.Printf("failed to get new TCP connection fd")
@@ -1041,11 +1047,6 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	if st == nil {
 		return
 	}
-
-	// Rui: store the accepted TCP connection in the map of the server.
-	tcpAddr := rawConn.RemoteAddr().(*net.TCPAddr)
-	key := string(fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port))
-	s.connMap.Store(key, st)
 
 	if cc, ok := rawConn.(interface {
 		PassServerTransport(transport.ServerTransport)
@@ -1589,6 +1590,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 		}
 		return err
 	}
+	timetrace.Record1("%d finish sending response", stream.Mark)
 	if len(binlogs) != 0 {
 		h, _ := stream.Header()
 		sh := &binarylog.ServerHeader{

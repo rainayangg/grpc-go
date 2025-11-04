@@ -775,6 +775,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 
 		// Rui: komaPull which tries to pull a message from the in-kernel central queue.
 		// fmt.Printf("HandleStreamsKoma: start koma pull\n")
+		timetrace.Record1("%d Koma Pull Start", t.framer.komafr.GetMark())
 		koma.KomaPull(komafd)
 
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
@@ -794,6 +795,11 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		val, ok := m.Load(remoteAddr)
 		if !ok {
 			fmt.Printf("connection %s not found in the map!\n", remoteAddr)
+			// Print all key-value pairs
+			m.Range(func(key, value any) bool {
+				fmt.Printf("%v: %v\n", key, value)
+				return true // continue iteration
+			})
 			return
 		}
 		tcpSt := val.(*http2Server)
