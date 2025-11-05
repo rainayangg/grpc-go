@@ -55,7 +55,7 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
-	"google.golang.org/grpc/timetrace"
+	// "google.golang.org/grpc/timetrace"
 )
 
 const (
@@ -931,7 +931,7 @@ func (s *Server) Serve(lis net.Listener) error {
 			<-s.done.Done()
 		}
 	}()
-	timetrace.Record0("grpc.server.serve")
+	// timetrace.Record0("grpc.server.serve")
 	ls := &listenSocket{
 		Listener: lis,
 		channelz: channelz.RegisterSocket(&channelz.Socket{
@@ -1463,7 +1463,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 		defer payInfo.free()
 	}
 
-	timetrace.Record1("%d recvAndDecompress", stream.Mark)
+	// timetrace.Record1("%d recvAndDecompress", stream.Mark)
 	d, err := recvAndDecompress(&parser{r: stream, bufferPool: s.opts.bufferPool}, stream, dc, s.opts.maxReceiveMessageSize, payInfo, decomp, true)
 	if err != nil {
 		if e := stream.WriteStatus(status.Convert(err)); e != nil {
@@ -1556,7 +1556,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 		comp = encoding.GetCompressor(stream.SendCompress())
 	}
 
-	timetrace.Record1("%d to send response", stream.Mark)
+	// timetrace.Record1("%d to send response", stream.Mark)
 	if err := s.sendResponse(ctx, stream, reply, cp, opts, comp); err != nil {
 		if err == io.EOF {
 			// The entire stream is done (for unary RPC only).
@@ -1590,7 +1590,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 		}
 		return err
 	}
-	timetrace.Record1("%d finish sending response", stream.Mark)
+	// timetrace.Record1("%d finish sending response", stream.Mark)
 	if len(binlogs) != 0 {
 		h, _ := stream.Header()
 		sh := &binarylog.ServerHeader{

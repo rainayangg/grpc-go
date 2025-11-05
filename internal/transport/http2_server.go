@@ -42,7 +42,7 @@ import (
 	istatus "google.golang.org/grpc/internal/status"
 	"google.golang.org/grpc/internal/syscall"
 	"google.golang.org/grpc/mem"
-	"google.golang.org/grpc/timetrace"
+	// "google.golang.org/grpc/timetrace"
 	"google.golang.org/protobuf/proto"
 
 	"google.golang.org/grpc/codes"
@@ -1063,13 +1063,13 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 
 		// Rui: komaPull which tries to pull a message from the in-kernel central queue.
 		// fmt.Printf("HandleStreamsKoma: start koma pull\n")
-		timetrace.Record1("%d Koma Pull Start", t.framer.komafr.GetMark())
+		// timetrace.Record1("%d Koma Pull Start", t.framer.komafr.GetMark())
 		koma.KomaPull(komafd)
 
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
 		// fmt.Printf("HandleStreamsKoma: start Reading frames\n")
 		frames, err := t.framer.komafr.ReadFrames()
-		timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
+		// timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
 		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
 		// fmt.Printf("%+v\n", frames)
 
@@ -1139,7 +1139,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				stream.Mark = t.framer.komafr.GetMark()
 			case *http2.DataFrame:
 				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
-				tcpSt.handleData(frame)
+				tcpSt.handleDataKoma(frame, stream)
 			case *http2.RSTStreamFrame:
 				// fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
 				tcpSt.handleRSTStream(frame)
@@ -1232,6 +1232,68 @@ func (t *http2Server) updateFlowControl(n uint32) {
 			},
 		},
 	})
+}
+
+func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
+	size := f.Header().Length
+	var sendBDPPing bool
+	if t.bdpEst != nil {
+		sendBDPPing = t.bdpEst.add(size)
+	}
+	// Decouple connection's flow control from application's read.
+	// An update on connection's flow control should not depend on
+	// whether user application has read the data or not. Such a
+	// restriction is already imposed on the stream's flow control,
+	// and therefore the sender will be blocked anyways.
+	// Decoupling the connection flow control will prevent other
+	// active(fast) streams from starving in presence of slow or
+	// inactive streams.
+	if w := t.fc.onData(size); w > 0 {
+		// fmt.Printf("http2_server.go: handleData: send connection-level window update of %d\n", w)
+		t.controlBuf.put(&outgoingWindowUpdate{
+			streamID:  0,
+			increment: w,
+		})
+	}
+	if sendBDPPing {
+		// Avoid excessive ping detection (e.g. in an L7 proxy)
+		// by sending a window update prior to the BDP ping.
+		if w := t.fc.reset(); w > 0 {
+			t.controlBuf.put(&outgoingWindowUpdate{
+				streamID:  0,
+				increment: w,
+			})
+		}
+		t.controlBuf.put(bdpPing)
+	}
+
+	// Select the right stream to dispatch.
+	if s.getState() == streamReadDone {
+		t.closeStream(s, true, http2.ErrCodeStreamClosed, false)
+		return
+	}
+	if size > 0 {
+		if err := s.fc.onData(size); err != nil {
+			t.closeStream(s, true, http2.ErrCodeFlowControl, false)
+			return
+		}
+		if f.Header().Flags.Has(http2.FlagDataPadded) {
+			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
+				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
+			}
+		}
+		// TODO(bradfitz, zhaoq): A copy is required here because there is no
+		// guarantee f.Data() is consumed before the arrival of next frame.
+		// Can this copy be eliminated?
+		if len(f.Data()) > 0 {
+			s.write(recvMsg{buffer: &mem.KomaBuffer{Data: f.Data()}})
+		}
+	}
+	if f.StreamEnded() {
+		// Received the end of stream from the client.
+		s.compareAndSwapState(streamActive, streamReadDone)
+		s.write(recvMsg{err: io.EOF})
+	}
 }
 
 func (t *http2Server) handleData(f *http2.DataFrame) {
