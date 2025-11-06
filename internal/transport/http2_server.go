@@ -1709,15 +1709,13 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 		onWrite:   t.setResetPingStrikes,
 	}
 
-	success, err := t.controlBuf.executeAndPut(func() bool {
-		return t.checkForHeaderListSize(trailingHeader)
-	}, nil)
-	if !success {
-		if err != nil {
-			return err
-		}
-		t.closeStream(s, true, http2.ErrCodeInternal, false)
-		return ErrHeaderListSizeLimitViolation
+	// success, err := t.controlBuf.executeAndPut(func() bool {
+	// 	return t.checkForHeaderListSize(trailingHeader)
+	// }, nil)
+
+	err := t.processHeaderFrame(s, trailingHeader)
+	if err != nil {
+		return err
 	}
 	// Send a RST_STREAM after the trailers if the client has not already half-closed.
 	rst := s.getState() == streamActive
