@@ -134,6 +134,10 @@ type http2Server struct {
 	maxStreamID uint32 // max stream ID ever seen
 
 	logger *grpclog.PrefixLogger
+
+	// copied here from loopyWriter
+	hBuf *bytes.Buffer  // The buffer for HPACK encoding.
+	hEnc *hpack.Encoder // HPACK encoder.
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -256,6 +260,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		LocalAddr: conn.LocalAddr(),
 		AuthInfo:  authInfo,
 	}
+	var buf bytes.Buffer // from loopyWriter
 	t := &http2Server{
 		done:              done,
 		conn:              conn,
@@ -274,6 +279,8 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		kep:               kep,
 		initialWindowSize: iwz,
 		bufferPool:        config.BufferPool,
+		hBuf:              &buf,
+		hEnc:              hpack.NewEncoder(&buf),
 	}
 	var czSecurity credentials.ChannelzSecurityValue
 	if au, ok := authInfo.(credentials.ChannelzSecurityInfo); ok {
@@ -444,7 +451,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			buf: buf,
 			fc:  &inFlow{limit: uint32(tst.initialWindowSize)},
 		},
-		st:               tst,
+		st:               t,
 		headerWireLength: int(frame.Header().Length),
 	}
 	var (
@@ -1236,10 +1243,11 @@ func (t *http2Server) updateFlowControl(n uint32) {
 
 func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 	size := f.Header().Length
-	var sendBDPPing bool
-	if t.bdpEst != nil {
-		sendBDPPing = t.bdpEst.add(size)
-	}
+	// var sendBDPPing bool
+	// if t.bdpEst != nil {
+	// 	sendBDPPing = t.bdpEst.add(size)
+	// }
+
 	// Decouple connection's flow control from application's read.
 	// An update on connection's flow control should not depend on
 	// whether user application has read the data or not. Such a
@@ -1255,17 +1263,18 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 			increment: w,
 		})
 	}
-	if sendBDPPing {
-		// Avoid excessive ping detection (e.g. in an L7 proxy)
-		// by sending a window update prior to the BDP ping.
-		if w := t.fc.reset(); w > 0 {
-			t.controlBuf.put(&outgoingWindowUpdate{
-				streamID:  0,
-				increment: w,
-			})
-		}
-		t.controlBuf.put(bdpPing)
-	}
+
+	// if sendBDPPing {
+	// 	// Avoid excessive ping detection (e.g. in an L7 proxy)
+	// 	// by sending a window update prior to the BDP ping.
+	// 	if w := t.fc.reset(); w > 0 {
+	// 		t.controlBuf.put(&outgoingWindowUpdate{
+	// 			streamID:  0,
+	// 			increment: w,
+	// 		})
+	// 	}
+	// 	t.controlBuf.put(bdpPing)
+	// }
 
 	// Select the right stream to dispatch.
 	if s.getState() == streamReadDone {
@@ -1538,9 +1547,86 @@ func (t *http2Server) setResetPingStrikes() {
 	atomic.StoreUint32(&t.resetPingStrikes, 1)
 }
 
+// Koma only; processing header frame and send them out later. Note that the
+// logic of the code is mainly adopted from func (l *loopyWriter) headerHandler(h *headerFrame)
+// in controlbuf.go
+func (t *http2Server) processHeaderFrame(s *ServerStream, h *headerFrame) error {
+	// Case 1.A: Server is responding back with headers.
+	// Comment it here because its the same with the 1.B case.
+
+	// else:  Case 1.B: Server wants to close stream.
+	// TODO (Rui): if its a trailer header, in original grpc, it first checks
+	// stream.state, if it is not empty (active processing/waiting for quota),
+	// then it queues this frame to itl, to maintain correct ordering. We skip
+	// this step in koma for now, because we do atomic reply sending, and do
+	// not consider stream-level flow control yet.
+	// if err := l.writeHeader(h.streamID, h.endStream, h.hf, h.onWrite); err != nil {
+	// 	return err
+	// }
+	// below is the logic of func (l *loopyWriter) writeHeader(): split the
+	fmt.Printf("processHeaderFrame: 0\n")
+	if h.onWrite != nil {
+		h.onWrite()
+	}
+	t.hBuf.Reset()
+	for _, f := range h.hf {
+		if err := t.hEnc.WriteField(f); err != nil {
+			if t.logger.V(logLevel) {
+				t.logger.Warningf("Encountered error while encoding headers: %v", err)
+			}
+		}
+	}
+	var (
+		err               error
+		endHeaders, first bool
+	)
+	first = true
+	fmt.Printf("processHeaderFrame: 1\n")
+	for !endHeaders {
+		size := t.hBuf.Len()
+		if size > http2MaxFrameLen {
+			size = http2MaxFrameLen
+		} else {
+			endHeaders = true
+		}
+		fmt.Printf("processHeaderFrame: 1.0\n")
+		if first {
+			fmt.Printf("processHeaderFrame: 1.1\n")
+			first = false
+			err = t.framer.komafr.WriteHeaders(http2.HeadersFrameParam{
+				StreamID:      s.id,
+				BlockFragment: t.hBuf.Next(size),
+				EndStream:     h.endStream,
+				EndHeaders:    endHeaders,
+			})
+		} else {
+			fmt.Printf("processHeaderFrame: 1.2\n")
+			err = t.framer.komafr.WriteContinuation(
+				s.id,
+				endHeaders,
+				t.hBuf.Next(size),
+			)
+		}
+		if err != nil {
+			fmt.Printf("processHeaderFrame: error writing headers: %v\n", err)
+			return err
+		}
+	}
+	fmt.Printf("processHeaderFrame: 2\n")
+	if h.cleanup != nil && h.cleanup.rst { // If RST_STREAM needs to be sent.
+		fmt.Printf("processHeaderFrame: 3\n")
+		// if err := t.framer.komafr.WriteRSTStream(h.cleanup.streamID, h.cleanup.rstCode); err != nil {
+		// 	return err
+		// }
+	}
+	fmt.Printf("processHeaderFrame: 4\n")
+	return nil
+}
+
 func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
+	fmt.Printf("writeHeaderLocked: 0\n")
 	headerFields := make([]hpack.HeaderField, 0, 2) // at least :status, content-type will be there if none else.
 	headerFields = append(headerFields, hpack.HeaderField{Name: ":status", Value: "200"})
 	headerFields = append(headerFields, hpack.HeaderField{Name: "content-type", Value: grpcutil.ContentType(s.contentSubtype)})
@@ -1554,13 +1640,12 @@ func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 		endStream: false,
 		onWrite:   t.setResetPingStrikes,
 	}
-	success, err := t.controlBuf.executeAndPut(func() bool { return t.checkForHeaderListSize(hf) }, hf)
-	if !success {
-		if err != nil {
-			return err
-		}
-		t.closeStream(s, true, http2.ErrCodeInternal, false)
-		return ErrHeaderListSizeLimitViolation
+	fmt.Printf("writeHeaderLocked: 1\n")
+	// success, err := t.controlBuf.executeAndPut(func() bool { return t.checkForHeaderListSize(hf) }, hf)
+	err := t.processHeaderFrame(s, hf)
+	if err != nil {
+		fmt.Printf("writeHeaderLocked: processHeaderFrame error: %v\n", err)
+		return err
 	}
 	for _, sh := range t.stats {
 		// Note: Headers are compressed with hpack after this call returns.
@@ -1650,14 +1735,18 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 // Write converts the data into HTTP2 data frame and sends it out. Non-nil error
 // is returns if it fails (e.g., framing error, transport error).
 func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
+	fmt.Printf("Write: 0\n")
 	reader := data.Reader()
 
+	fmt.Printf("Write: 1\n")
 	if !s.isHeaderSent() { // Headers haven't been written yet.
+		fmt.Printf("!s.isHeaderSent()\n")
 		if err := t.writeHeader(s, nil); err != nil {
 			_ = reader.Close()
 			return err
 		}
 	} else {
+		fmt.Printf("s.isHeaderSent()\n")
 		// Writing headers checks for this condition.
 		if s.getState() == streamDone {
 			_ = reader.Close()
@@ -1665,6 +1754,7 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 		}
 	}
 
+	fmt.Printf("Write: 2\n")
 	df := &dataFrame{
 		streamID:    s.id,
 		h:           hdr,
@@ -1675,11 +1765,48 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 		_ = reader.Close()
 		return t.streamContextErr(s)
 	}
-	if err := t.controlBuf.put(df); err != nil {
-		_ = reader.Close()
+	// if err := t.controlBuf.put(df); err != nil {
+	// 	_ = reader.Close()
+	// 	return err
+	// }
+	// t.incrMsgSent()
+
+	// Comment out the above lines to disable controlBuf, and use Koma tx instead.
+	// the following logic ic a simplified version (w/o flow control) of processData() in loopy_writer.go
+	fmt.Printf("Write: 3\n")
+	if len(df.h) == 0 && df.reader.Remaining() == 0 {
+		//Empty data Frame
+		// Client sends out empty data frame with endStream = true
+		if err := t.framer.komafr.WriteData(df.streamID, df.endStream, nil); err != nil {
+			return err
+		}
+		_ = df.reader.Close()
+		return nil
+	}
+
+	var buf *[]byte
+	pool := t.bufferPool
+	if pool == nil {
+		pool = mem.DefaultBufferPool()
+	}
+	hSize := len(df.h)
+	dSize := df.reader.Remaining()
+	buf = pool.Get(hSize + dSize)
+	defer pool.Put(buf)
+
+	copy((*buf)[:hSize], df.h)
+	_, _ = df.reader.Read((*buf)[hSize:])
+
+	// endStream is not set here
+	if df.onEachWrite != nil {
+		df.onEachWrite()
+	}
+	fmt.Printf("http2_server.go: write: write data frame of size %d (header %d + data %d) on stream %d\n", hSize+dSize, hSize, dSize, df.streamID)
+	if err := t.framer.komafr.WriteData(df.streamID, df.endStream, (*buf)[:hSize+dSize]); err != nil {
 		return err
 	}
-	t.incrMsgSent()
+	df.reader.Close()
+
 	return nil
 }
 
