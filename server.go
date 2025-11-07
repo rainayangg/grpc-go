@@ -1623,7 +1623,10 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 			binlog.Log(ctx, st)
 		}
 	}
-	return stream.WriteStatus(statusOK)
+	fmt.Printf("ProcessUnaryRPC: start WriteStatus\n")
+	err = stream.WriteStatus(statusOK)
+	fmt.Printf("ProcessUnaryRPC: finish WriteStatus\n")
+	return err
 }
 
 // chainStreamServerInterceptors chains all stream server interceptors into one.

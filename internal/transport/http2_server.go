@@ -1461,10 +1461,10 @@ func (t *http2Server) handlePing(f *http2.PingFrame) {
 		}
 	}
 
-	if t.pingStrikes > maxPingStrikes {
-		// Send goaway and close the connection.
-		t.controlBuf.put(&goAway{code: http2.ErrCodeEnhanceYourCalm, debugData: []byte("too_many_pings"), closeConn: errors.New("got too many pings from the client")})
-	}
+	// if t.pingStrikes > maxPingStrikes {
+	// 	// Send goaway and close the connection.
+	// 	t.controlBuf.put(&goAway{code: http2.ErrCodeEnhanceYourCalm, debugData: []byte("too_many_pings"), closeConn: errors.New("got too many pings from the client")})
+	// }
 }
 
 func (t *http2Server) handleWindowUpdate(f *http2.WindowUpdateFrame) {
@@ -1714,6 +1714,7 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 	// }, nil)
 
 	err := t.processHeaderFrame(s, trailingHeader)
+	fmt.Printf("http2_server.go: writeStatus: processHeaderFrame returned err %v\n", err)
 	if err != nil {
 		return err
 	}
@@ -1974,7 +1975,12 @@ func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrC
 			t.deleteStream(s, eosReceived)
 		},
 	}
-	t.controlBuf.put(hdr)
+	// t.controlBuf.put(hdr)
+	if rst {
+		if err := t.framer.komafr.WriteRSTStream(s.id, rstCode); err != nil {
+			return
+		}
+	}
 }
 
 // closeStream clears the footprint of a stream when the stream is not needed any more.
