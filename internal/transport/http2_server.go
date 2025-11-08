@@ -415,6 +415,10 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 	return t, nil
 }
 
+func (t *http2Server) processCleanupStream(streamID uint32, rstCode http2.ErrCode) error {
+	return t.framer.komafr.WriteRSTStream(streamID, rstCode)
+}
+
 // operateHeadersKoma takes action on the decoded headers. Returns an error if fatal
 // error encountered and transport needs to close, otherwise returns nil.
 func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame, tst *http2Server) (*ServerStream, error) {
@@ -427,12 +431,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 	// frame.Truncated is set to true when framer detects that the current header
 	// list size hits MaxHeaderListSize limit.
 	if frame.Truncated {
-		tst.controlBuf.put(&cleanupStream{
-			streamID: streamID,
-			rst:      true,
-			rstCode:  http2.ErrCodeFrameSize,
-			onWrite:  func() {},
-		})
+		t.processCleanupStream(streamID, http2.ErrCodeFrameSize)
 		return nil, nil
 	}
 
@@ -533,6 +532,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		if tst.logger.V(logLevel) {
 			tst.logger.Infof("Aborting the stream early: %v", errMsg)
 		}
+		// TODO (Rui): remove this to direct koma tx.
 		tst.controlBuf.put(&earlyAbortStream{
 			httpStatus:     http.StatusBadRequest,
 			streamID:       streamID,
@@ -544,12 +544,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 	}
 
 	if protocolError {
-		tst.controlBuf.put(&cleanupStream{
-			streamID: streamID,
-			rst:      true,
-			rstCode:  http2.ErrCodeProtocol,
-			onWrite:  func() {},
-		})
+		t.processCleanupStream(streamID, http2.ErrCodeProtocol)
 		return s, nil
 	}
 	if !isGRPC {
@@ -606,6 +601,8 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		s.cancel()
 		return s, nil
 	}
+
+	// TODO (Rui): move to kernel
 	if uint32(len(tst.activeStreams)) >= tst.maxStreams {
 		tst.mu.Unlock()
 		tst.controlBuf.put(&cleanupStream{
@@ -1102,19 +1099,9 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		if err != nil {
-			if se, ok := err.(http2.StreamError); ok {
-				if t.logger.V(logLevel) {
-					t.logger.Warningf("Encountered http2.StreamError: %v", se)
-				}
-				tcpSt.mu.Lock()
-				s := tcpSt.activeStreams[se.StreamID]
-				tcpSt.mu.Unlock()
-				if s != nil {
-					tcpSt.closeStream(s, true, se.Code, false)
-				} else {
-					fmt.Printf("Write RST stream for %d", se.StreamID)
-					tcpSt.framer.fr.WriteRSTStream(se.StreamID, se.Code)
-				}
+			if _, ok := err.(http2.StreamError); ok {
+				fmt.Printf("Write RST stream for %d", frames[0].Header().StreamID)
+				tcpSt.framer.fr.WriteRSTStream(frames[0].Header().StreamID, err.(http2.StreamError).Code)
 				continue
 			}
 			tcpSt.Close(err)
@@ -1135,6 +1122,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				if err != nil {
 					// Any error processing client headers, e.g. invalid stream ID,
 					// is considered a protocol violation.
+					// TODO (Rui): disable this goAway contorlBuf. the associated handler is
+					// func (t *http2Server) outgoingGoAwayHandler(g *goAway)
 					tcpSt.controlBuf.put(&goAway{
 						code:      http2.ErrCodeProtocol,
 						debugData: []byte(err.Error()),
@@ -1615,9 +1604,9 @@ func (t *http2Server) processHeaderFrame(s *ServerStream, h *headerFrame) error 
 	fmt.Printf("processHeaderFrame: 2\n")
 	if h.cleanup != nil && h.cleanup.rst { // If RST_STREAM needs to be sent.
 		fmt.Printf("processHeaderFrame: 3\n")
-		// if err := t.framer.komafr.WriteRSTStream(h.cleanup.streamID, h.cleanup.rstCode); err != nil {
-		// 	return err
-		// }
+		if err := t.processCleanupStream(h.cleanup.streamID, h.cleanup.rstCode); err != nil {
+			return err
+		}
 	}
 	fmt.Printf("processHeaderFrame: 4\n")
 	return nil
@@ -1977,9 +1966,7 @@ func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrC
 	}
 	// t.controlBuf.put(hdr)
 	if rst {
-		if err := t.framer.komafr.WriteRSTStream(s.id, rstCode); err != nil {
-			return
-		}
+		t.processCleanupStream(s.id, rstCode)
 	}
 }
 
