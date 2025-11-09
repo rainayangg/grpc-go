@@ -415,6 +415,37 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 	return t, nil
 }
 
+// handle earlyabortstreams, adapted from func (l *loopyWriter) earlyAbortStreamHandler(eas *earlyAbortStream)
+func (t *http2Server) processEarlyAbortStream(eas *earlyAbortStream) error {
+	// In case the caller forgets to set the http status, default to 200.
+	if eas.httpStatus == 0 {
+		eas.httpStatus = 200
+	}
+	headerFields := []hpack.HeaderField{
+		{Name: ":status", Value: strconv.Itoa(int(eas.httpStatus))},
+		{Name: "content-type", Value: grpcutil.ContentType(eas.contentSubtype)},
+		{Name: "grpc-status", Value: strconv.Itoa(int(eas.status.Code()))},
+		{Name: "grpc-message", Value: encodeGrpcMessage(eas.status.Message())},
+	}
+
+	h := &headerFrame{
+		streamID:  eas.streamID,
+		hf:        headerFields,
+		endStream: true,
+		onWrite:   nil,
+	}
+
+	if err := t.processHeaderFrame(eas.streamID, h); err != nil {
+		return err
+	}
+	if eas.rst {
+		if err := t.framer.komafr.WriteRSTStream(eas.streamID, http2.ErrCodeNo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (t *http2Server) processCleanupStream(streamID uint32, rstCode http2.ErrCode) error {
 	return t.framer.komafr.WriteRSTStream(streamID, rstCode)
 }
@@ -533,13 +564,14 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			tst.logger.Infof("Aborting the stream early: %v", errMsg)
 		}
 		// TODO (Rui): remove this to direct koma tx.
-		tst.controlBuf.put(&earlyAbortStream{
+		eas := &earlyAbortStream{
 			httpStatus:     http.StatusBadRequest,
 			streamID:       streamID,
 			contentSubtype: s.contentSubtype,
 			status:         status.New(codes.Internal, errMsg),
 			rst:            !frame.StreamEnded(),
-		})
+		}
+		t.processEarlyAbortStream(eas)
 		return s, nil
 	}
 
@@ -548,23 +580,25 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		return s, nil
 	}
 	if !isGRPC {
-		tst.controlBuf.put(&earlyAbortStream{
+		eas := &earlyAbortStream{
 			httpStatus:     http.StatusUnsupportedMediaType,
 			streamID:       streamID,
 			contentSubtype: s.contentSubtype,
 			status:         status.Newf(codes.InvalidArgument, "invalid gRPC request content-type %q", contentType),
 			rst:            !frame.StreamEnded(),
-		})
+		}
+		t.processEarlyAbortStream(eas)
 		return s, nil
 	}
 	if headerError != nil {
-		tst.controlBuf.put(&earlyAbortStream{
+		eas := &earlyAbortStream{
 			httpStatus:     http.StatusBadRequest,
 			streamID:       streamID,
 			contentSubtype: s.contentSubtype,
 			status:         headerError,
 			rst:            !frame.StreamEnded(),
-		})
+		}
+		t.processEarlyAbortStream(eas)
 		return s, nil
 	}
 
@@ -620,13 +654,14 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		if tst.logger.V(logLevel) {
 			tst.logger.Infof("Aborting the stream early: %v", errMsg)
 		}
-		tst.controlBuf.put(&earlyAbortStream{
+		eas := &earlyAbortStream{
 			httpStatus:     http.StatusMethodNotAllowed,
 			streamID:       streamID,
 			contentSubtype: s.contentSubtype,
 			status:         status.New(codes.Internal, errMsg),
 			rst:            !frame.StreamEnded(),
-		})
+		}
+		t.processEarlyAbortStream(eas)
 		s.cancel()
 		return s, nil
 	}
@@ -641,13 +676,14 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			if !ok {
 				stat = status.New(codes.PermissionDenied, err.Error())
 			}
-			tst.controlBuf.put(&earlyAbortStream{
+			eas := &earlyAbortStream{
 				httpStatus:     http.StatusOK,
 				streamID:       s.id,
 				contentSubtype: s.contentSubtype,
 				status:         stat,
 				rst:            !frame.StreamEnded(),
-			})
+			}
+			t.processEarlyAbortStream(eas)
 			return s, nil
 		}
 	}
@@ -818,13 +854,14 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		if t.logger.V(logLevel) {
 			t.logger.Infof("Aborting the stream early: %v", errMsg)
 		}
-		t.controlBuf.put(&earlyAbortStream{
+		eas := &earlyAbortStream{
 			httpStatus:     http.StatusBadRequest,
 			streamID:       streamID,
 			contentSubtype: s.contentSubtype,
 			status:         status.New(codes.Internal, errMsg),
 			rst:            !frame.StreamEnded(),
-		})
+		}
+		t.processEarlyAbortStream(eas)
 		return s, nil
 	}
 
@@ -838,23 +875,25 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		return s, nil
 	}
 	if !isGRPC {
-		t.controlBuf.put(&earlyAbortStream{
+		eas := &earlyAbortStream{
 			httpStatus:     http.StatusUnsupportedMediaType,
 			streamID:       streamID,
 			contentSubtype: s.contentSubtype,
 			status:         status.Newf(codes.InvalidArgument, "invalid gRPC request content-type %q", contentType),
 			rst:            !frame.StreamEnded(),
-		})
+		}
+		t.processEarlyAbortStream(eas)
 		return s, nil
 	}
 	if headerError != nil {
-		t.controlBuf.put(&earlyAbortStream{
+		eas := &earlyAbortStream{
 			httpStatus:     http.StatusBadRequest,
 			streamID:       streamID,
 			contentSubtype: s.contentSubtype,
 			status:         headerError,
 			rst:            !frame.StreamEnded(),
-		})
+		}
+		t.processEarlyAbortStream(eas)
 		return s, nil
 	}
 
@@ -908,13 +947,14 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		if t.logger.V(logLevel) {
 			t.logger.Infof("Aborting the stream early: %v", errMsg)
 		}
-		t.controlBuf.put(&earlyAbortStream{
+		eas := &earlyAbortStream{
 			httpStatus:     http.StatusMethodNotAllowed,
 			streamID:       streamID,
 			contentSubtype: s.contentSubtype,
 			status:         status.New(codes.Internal, errMsg),
 			rst:            !frame.StreamEnded(),
-		})
+		}
+		t.processEarlyAbortStream(eas)
 		s.cancel()
 		return s, nil
 	}
@@ -1539,7 +1579,7 @@ func (t *http2Server) setResetPingStrikes() {
 // Koma only; processing header frame and send them out later. Note that the
 // logic of the code is mainly adopted from func (l *loopyWriter) headerHandler(h *headerFrame)
 // in controlbuf.go
-func (t *http2Server) processHeaderFrame(s *ServerStream, h *headerFrame) error {
+func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error {
 	// Case 1.A: Server is responding back with headers.
 	// Comment it here because its the same with the 1.B case.
 
@@ -1583,7 +1623,7 @@ func (t *http2Server) processHeaderFrame(s *ServerStream, h *headerFrame) error 
 			fmt.Printf("processHeaderFrame: 1.1\n")
 			first = false
 			err = t.framer.komafr.WriteHeaders(http2.HeadersFrameParam{
-				StreamID:      s.id,
+				StreamID:      streamId,
 				BlockFragment: t.hBuf.Next(size),
 				EndStream:     h.endStream,
 				EndHeaders:    endHeaders,
@@ -1591,7 +1631,7 @@ func (t *http2Server) processHeaderFrame(s *ServerStream, h *headerFrame) error 
 		} else {
 			fmt.Printf("processHeaderFrame: 1.2\n")
 			err = t.framer.komafr.WriteContinuation(
-				s.id,
+				streamId,
 				endHeaders,
 				t.hBuf.Next(size),
 			)
@@ -1631,7 +1671,7 @@ func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 	}
 	fmt.Printf("writeHeaderLocked: 1\n")
 	// success, err := t.controlBuf.executeAndPut(func() bool { return t.checkForHeaderListSize(hf) }, hf)
-	err := t.processHeaderFrame(s, hf)
+	err := t.processHeaderFrame(s.id, hf)
 	if err != nil {
 		fmt.Printf("writeHeaderLocked: processHeaderFrame error: %v\n", err)
 		return err
@@ -1702,7 +1742,7 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 	// 	return t.checkForHeaderListSize(trailingHeader)
 	// }, nil)
 
-	err := t.processHeaderFrame(s, trailingHeader)
+	err := t.processHeaderFrame(s.id, trailingHeader)
 	fmt.Printf("http2_server.go: writeStatus: processHeaderFrame returned err %v\n", err)
 	if err != nil {
 		return err
