@@ -1175,7 +1175,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 				stream.Mark = t.framer.komafr.GetMark()
 			case *http2.DataFrame:
 				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
-				tcpSt.handleDataKoma(frame, stream)
+				t.handleDataKoma(frame, stream)
 			case *http2.RSTStreamFrame:
 				// fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
 				tcpSt.handleRSTStream(frame)
@@ -1285,13 +1285,13 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 	// Decoupling the connection flow control will prevent other
 	// active(fast) streams from starving in presence of slow or
 	// inactive streams.
-	if w := t.fc.onData(size); w > 0 {
-		// fmt.Printf("http2_server.go: handleData: send connection-level window update of %d\n", w)
-		t.controlBuf.put(&outgoingWindowUpdate{
-			streamID:  0,
-			increment: w,
-		})
-	}
+	// if w := t.fc.onData(size); w > 0 {
+	// 	// fmt.Printf("http2_server.go: handleData: send connection-level window update of %d\n", w)
+	// 	t.controlBuf.put(&outgoingWindowUpdate{
+	// 		streamID:  0,
+	// 		increment: w,
+	// 	})
+	// }
 
 	// if sendBDPPing {
 	// 	// Avoid excessive ping detection (e.g. in an L7 proxy)
@@ -1307,19 +1307,19 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 
 	// Select the right stream to dispatch.
 	if s.getState() == streamReadDone {
-		t.closeStream(s, true, http2.ErrCodeStreamClosed, false)
+		// t.closeStream(s, true, http2.ErrCodeStreamClosed, false)
 		return
 	}
 	if size > 0 {
-		if err := s.fc.onData(size); err != nil {
-			t.closeStream(s, true, http2.ErrCodeFlowControl, false)
-			return
-		}
-		if f.Header().Flags.Has(http2.FlagDataPadded) {
-			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
-				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
-			}
-		}
+		// if err := s.fc.onData(size); err != nil {
+		// 	t.closeStream(s, true, http2.ErrCodeFlowControl, false)
+		// 	return
+		// }
+		// if f.Header().Flags.Has(http2.FlagDataPadded) {
+		// 	if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
+		// 		t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
+		// 	}
+		// }
 		// TODO(bradfitz, zhaoq): A copy is required here because there is no
 		// guarantee f.Data() is consumed before the arrival of next frame.
 		// Can this copy be eliminated?
