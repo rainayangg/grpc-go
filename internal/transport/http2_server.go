@@ -629,25 +629,25 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 	if len(mdata) > 0 {
 		s.ctx = metadata.NewIncomingContext(s.ctx, mdata)
 	}
-	tst.mu.Lock()
-	if tst.state != reachable {
-		tst.mu.Unlock()
-		s.cancel()
-		return s, nil
-	}
+	// tst.mu.Lock()
+	// if tst.state != reachable {
+	// 	tst.mu.Unlock()
+	// 	s.cancel()
+	// 	return s, nil
+	// }
 
 	// TODO (Rui): move to kernel
-	if uint32(len(tst.activeStreams)) >= tst.maxStreams {
-		tst.mu.Unlock()
-		tst.controlBuf.put(&cleanupStream{
-			streamID: streamID,
-			rst:      true,
-			rstCode:  http2.ErrCodeRefusedStream,
-			onWrite:  func() {},
-		})
-		s.cancel()
-		return s, nil
-	}
+	// if uint32(len(tst.activeStreams)) >= tst.maxStreams {
+	// 	tst.mu.Unlock()
+	// 	tst.controlBuf.put(&cleanupStream{
+	// 		streamID: streamID,
+	// 		rst:      true,
+	// 		rstCode:  http2.ErrCodeRefusedStream,
+	// 		onWrite:  func() {},
+	// 	})
+	// 	s.cancel()
+	// 	return s, nil
+	// }
 	if httpMethod != http.MethodPost {
 		tst.mu.Unlock()
 		errMsg := fmt.Sprintf("Received a HEADERS frame with :method %q which should be POST", httpMethod)
@@ -665,32 +665,32 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		s.cancel()
 		return s, nil
 	}
-	if tst.inTapHandle != nil {
-		var err error
-		if s.ctx, err = tst.inTapHandle(s.ctx, &tap.Info{FullMethodName: s.method, Header: mdata}); err != nil {
-			tst.mu.Unlock()
-			if tst.logger.V(logLevel) {
-				tst.logger.Infof("Aborting the stream early due to InTapHandle failure: %v", err)
-			}
-			stat, ok := status.FromError(err)
-			if !ok {
-				stat = status.New(codes.PermissionDenied, err.Error())
-			}
-			eas := &earlyAbortStream{
-				httpStatus:     http.StatusOK,
-				streamID:       s.id,
-				contentSubtype: s.contentSubtype,
-				status:         stat,
-				rst:            !frame.StreamEnded(),
-			}
-			t.processEarlyAbortStream(eas)
-			return s, nil
-		}
-	}
-	tst.activeStreams[streamID] = s
-	if len(tst.activeStreams) == 1 {
-		tst.idle = time.Time{}
-	}
+	// if tst.inTapHandle != nil {
+	// 	var err error
+	// 	if s.ctx, err = tst.inTapHandle(s.ctx, &tap.Info{FullMethodName: s.method, Header: mdata}); err != nil {
+	// 		tst.mu.Unlock()
+	// 		if tst.logger.V(logLevel) {
+	// 			tst.logger.Infof("Aborting the stream early due to InTapHandle failure: %v", err)
+	// 		}
+	// 		stat, ok := status.FromError(err)
+	// 		if !ok {
+	// 			stat = status.New(codes.PermissionDenied, err.Error())
+	// 		}
+	// 		eas := &earlyAbortStream{
+	// 			httpStatus:     http.StatusOK,
+	// 			streamID:       s.id,
+	// 			contentSubtype: s.contentSubtype,
+	// 			status:         stat,
+	// 			rst:            !frame.StreamEnded(),
+	// 		}
+	// 		t.processEarlyAbortStream(eas)
+	// 		return s, nil
+	// 	}
+	// }
+	// tst.activeStreams[streamID] = s
+	// if len(tst.activeStreams) == 1 {
+	// 	tst.idle = time.Time{}
+	// }
 	// Start a timer to close the stream on reaching the deadline.
 	if timeoutSet {
 		// We need to wait for s.cancel to be updated before calling
@@ -708,13 +708,13 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		}
 		close(cancelUpdated)
 	}
-	tst.mu.Unlock()
-	if channelz.IsOn() {
-		tst.channelz.SocketMetrics.StreamsStarted.Add(1)
-		tst.channelz.SocketMetrics.LastRemoteStreamCreatedTimestamp.Store(time.Now().UnixNano())
-	}
+	// tst.mu.Unlock()
+	// if channelz.IsOn() {
+	// 	tst.channelz.SocketMetrics.StreamsStarted.Add(1)
+	// 	tst.channelz.SocketMetrics.LastRemoteStreamCreatedTimestamp.Store(time.Now().UnixNano())
+	// }
 	s.requestRead = func(n int) {
-		tst.adjustWindow(s, uint32(n))
+		// tst.adjustWindow(s, uint32(n))
 	}
 	s.ctxDone = s.ctx.Done()
 	s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
@@ -725,14 +725,14 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			recv:    s.buf,
 		},
 		windowHandler: func(n int) {
-			tst.updateWindow(s, uint32(n))
+			// tst.updateWindow(s, uint32(n))
 		},
 	}
 	// Register the stream with loopy.
-	tst.controlBuf.put(&registerStream{
-		streamID: s.id,
-		wq:       s.wq,
-	})
+	// tst.controlBuf.put(&registerStream{
+	// 	streamID: s.id,
+	// 	wq:       s.wq,
+	// })
 	return s, nil
 }
 
