@@ -347,7 +347,8 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		// koma.KomaPull(kconn.GetFd())
 
 		// need to call koma_pull first
-		frame, err := t.framer.fr.ReadFrame()
+		// frame, err := t.framer.fr.ReadFrame()
+		_, err := t.framer.fr.ReadFrame()
 		// fmt.Printf("Koma socket receives first frame after preface!\n")
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			fmt.Printf("Koma socket fails to read initial settings frame 1\n")
@@ -358,11 +359,11 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 			return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to read initial settings frame: %v", err)
 		}
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
-		sf, ok := frame.(*http2.SettingsFrame)
-		if !ok {
-			fmt.Printf("Koma socket fails to read initial settings frame 3\n")
-			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
-		}
+		// sf, ok := frame.(*http2.SettingsFrame)
+		// if !ok {
+		// 	fmt.Printf("Koma socket fails to read initial settings frame 3\n")
+		// 	return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
+		// }
 		// fmt.Printf("Koma socket receives the initial settings frame!\n")
 
 		// print map
@@ -380,38 +381,38 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		//}
 		//tcpSt := val.(*http2Server)
 		// fmt.Printf("Koma socket to send the settings ack\n")
-		t.handleSettings(sf)
+		// t.handleSettings(sf)
 
 	}
 
 	// Rui: LoopyWriter is only needed for rawTCP (send messages back to the students in the TX path),
 	// but unnecessary for the koma connection, as we decided not to use Koma TX path.
-	if !ifkoma {
-		go func() {
-			t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger, t.outgoingGoAwayHandler, t.bufferPool)
-			err := t.loopy.run()
-			close(t.loopyWriterDone)
-			if !isIOError(err) {
-				// Close the connection if a non-I/O error occurs (for I/O errors
-				// the reader will also encounter the error and close).  Wait 1
-				// second before closing the connection, or when the reader is done
-				// (i.e. the client already closed the connection or a connection
-				// error occurred).  This avoids the potential problem where there
-				// is unread data on the receive side of the connection, which, if
-				// closed, would lead to a TCP RST instead of FIN, and the client
-				// encountering errors.  For more info:
-				// https://github.com/grpc/grpc-go/issues/5358
-				timer := time.NewTimer(time.Second)
-				defer timer.Stop()
-				select {
-				case <-t.readerDone:
-				case <-timer.C:
-				}
-				t.conn.Close()
-			}
-		}()
-		go t.keepalive()
-	}
+	// if !ifkoma {
+	// 	go func() {
+	// 		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger, t.outgoingGoAwayHandler, t.bufferPool)
+	// 		err := t.loopy.run()
+	// 		close(t.loopyWriterDone)
+	// 		if !isIOError(err) {
+	// 			// Close the connection if a non-I/O error occurs (for I/O errors
+	// 			// the reader will also encounter the error and close).  Wait 1
+	// 			// second before closing the connection, or when the reader is done
+	// 			// (i.e. the client already closed the connection or a connection
+	// 			// error occurred).  This avoids the potential problem where there
+	// 			// is unread data on the receive side of the connection, which, if
+	// 			// closed, would lead to a TCP RST instead of FIN, and the client
+	// 			// encountering errors.  For more info:
+	// 			// https://github.com/grpc/grpc-go/issues/5358
+	// 			timer := time.NewTimer(time.Second)
+	// 			defer timer.Stop()
+	// 			select {
+	// 			case <-t.readerDone:
+	// 			case <-timer.C:
+	// 			}
+	// 			t.conn.Close()
+	// 		}
+	// 	}()
+	// 	go t.keepalive()
+	// }
 	return t, nil
 }
 
@@ -1593,7 +1594,7 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error 
 	// 	return err
 	// }
 	// below is the logic of func (l *loopyWriter) writeHeader(): split the
-	fmt.Printf("processHeaderFrame: 0\n")
+	// fmt.Printf("processHeaderFrame: 0\n")
 	if h.onWrite != nil {
 		h.onWrite()
 	}
@@ -1610,7 +1611,7 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error 
 		endHeaders, first bool
 	)
 	first = true
-	fmt.Printf("processHeaderFrame: 1\n")
+	// fmt.Printf("processHeaderFrame: 1\n")
 	for !endHeaders {
 		size := t.hBuf.Len()
 		if size > http2MaxFrameLen {
@@ -1618,9 +1619,9 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error 
 		} else {
 			endHeaders = true
 		}
-		fmt.Printf("processHeaderFrame: 1.0\n")
+		// fmt.Printf("processHeaderFrame: 1.0\n")
 		if first {
-			fmt.Printf("processHeaderFrame: 1.1\n")
+			// fmt.Printf("processHeaderFrame: 1.1\n")
 			first = false
 			err = t.framer.komafr.WriteHeaders(http2.HeadersFrameParam{
 				StreamID:      streamId,
@@ -1629,7 +1630,7 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error 
 				EndHeaders:    endHeaders,
 			})
 		} else {
-			fmt.Printf("processHeaderFrame: 1.2\n")
+			// fmt.Printf("processHeaderFrame: 1.2\n")
 			err = t.framer.komafr.WriteContinuation(
 				streamId,
 				endHeaders,
@@ -1641,21 +1642,21 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error 
 			return err
 		}
 	}
-	fmt.Printf("processHeaderFrame: 2\n")
+	// fmt.Printf("processHeaderFrame: 2\n")
 	if h.cleanup != nil && h.cleanup.rst { // If RST_STREAM needs to be sent.
-		fmt.Printf("processHeaderFrame: 3\n")
+		// fmt.Printf("processHeaderFrame: 3\n")
 		if err := t.processCleanupStream(h.cleanup.streamID, h.cleanup.rstCode); err != nil {
 			return err
 		}
 	}
-	fmt.Printf("processHeaderFrame: 4\n")
+	// fmt.Printf("processHeaderFrame: 4\n")
 	return nil
 }
 
 func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
-	fmt.Printf("writeHeaderLocked: 0\n")
+	// fmt.Printf("writeHeaderLocked: 0\n")
 	headerFields := make([]hpack.HeaderField, 0, 2) // at least :status, content-type will be there if none else.
 	headerFields = append(headerFields, hpack.HeaderField{Name: ":status", Value: "200"})
 	headerFields = append(headerFields, hpack.HeaderField{Name: "content-type", Value: grpcutil.ContentType(s.contentSubtype)})
@@ -1669,7 +1670,7 @@ func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 		endStream: false,
 		onWrite:   t.setResetPingStrikes,
 	}
-	fmt.Printf("writeHeaderLocked: 1\n")
+	// fmt.Printf("writeHeaderLocked: 1\n")
 	// success, err := t.controlBuf.executeAndPut(func() bool { return t.checkForHeaderListSize(hf) }, hf)
 	err := t.processHeaderFrame(s.id, hf)
 	if err != nil {
@@ -1743,7 +1744,7 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 	// }, nil)
 
 	err := t.processHeaderFrame(s.id, trailingHeader)
-	fmt.Printf("http2_server.go: writeStatus: processHeaderFrame returned err %v\n", err)
+	// fmt.Printf("http2_server.go: writeStatus: processHeaderFrame returned err %v\n", err)
 	if err != nil {
 		return err
 	}
@@ -1763,18 +1764,18 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 // Write converts the data into HTTP2 data frame and sends it out. Non-nil error
 // is returns if it fails (e.g., framing error, transport error).
 func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
-	fmt.Printf("Write: 0\n")
+	// fmt.Printf("Write:0\n")
 	reader := data.Reader()
 
-	fmt.Printf("Write: 1\n")
+	// fmt.Printf("Write: 1\n")
 	if !s.isHeaderSent() { // Headers haven't been written yet.
-		fmt.Printf("!s.isHeaderSent()\n")
+		// fmt.Printf("!s.isHeaderSent()\n")
 		if err := t.writeHeader(s, nil); err != nil {
 			_ = reader.Close()
 			return err
 		}
 	} else {
-		fmt.Printf("s.isHeaderSent()\n")
+		// fmt.Printf("s.isHeaderSent()\n")
 		// Writing headers checks for this condition.
 		if s.getState() == streamDone {
 			_ = reader.Close()
@@ -1782,7 +1783,7 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 		}
 	}
 
-	fmt.Printf("Write: 2\n")
+	// fmt.Printf("Write: 2\n")
 	df := &dataFrame{
 		streamID:    s.id,
 		h:           hdr,
@@ -1801,7 +1802,7 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 
 	// Comment out the above lines to disable controlBuf, and use Koma tx instead.
 	// the following logic ic a simplified version (w/o flow control) of processData() in loopy_writer.go
-	fmt.Printf("Write: 3\n")
+	// fmt.Printf("Write: 3\n")
 	if len(df.h) == 0 && df.reader.Remaining() == 0 {
 		//Empty data Frame
 		// Client sends out empty data frame with endStream = true
@@ -1829,7 +1830,7 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 	if df.onEachWrite != nil {
 		df.onEachWrite()
 	}
-	fmt.Printf("http2_server.go: write: write data frame of size %d (header %d + data %d) on stream %d\n", hSize+dSize, hSize, dSize, df.streamID)
+	// fmt.Printf("http2_server.go: write: write data frame of size %d (header %d + data %d) on stream %d\n", hSize+dSize, hSize, dSize, df.streamID)
 	if err := t.framer.komafr.WriteData(df.streamID, df.endStream, (*buf)[:hSize+dSize]); err != nil {
 		return err
 	}

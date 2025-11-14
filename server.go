@@ -1248,14 +1248,14 @@ func (s *Server) incrCallsFailed() {
 }
 
 func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStream, msg any, cp Compressor, opts *transport.WriteOptions, comp encoding.Compressor) error {
-	fmt.Printf("Server: sendResponse called\n")
+	// fmt.Printf("Server: sendResponse called\n")
 	data, err := encode(s.getCodec(stream.ContentSubtype()), msg)
 	if err != nil {
 		channelz.Error(logger, s.channelz, "grpc: server failed to encode response: ", err)
 		return err
 	}
 
-	fmt.Printf("Server: sendResponse encoded data.Len=%d\n", data.Len())
+	// fmt.Printf("Server: sendResponse encoded data.Len=%d\n", data.Len())
 	compData, pf, err := compress(data, cp, comp, s.opts.bufferPool)
 	if err != nil {
 		data.Free()
@@ -1278,7 +1278,7 @@ func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStrea
 	if payloadLen > s.opts.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", payloadLen, s.opts.maxSendMessageSize)
 	}
-	fmt.Printf("Server: sendResponse payloadLen=%d\n", payloadLen)
+	// fmt.Printf("Server: sendResponse payloadLen=%d\n", payloadLen)
 	err = stream.Write(hdr, payload, opts)
 	if err == nil {
 		if len(s.opts.statsHandlers) != 0 {
@@ -1560,7 +1560,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 	}
 
 	// timetrace.Record1("%d to send response", stream.Mark)
-	fmt.Printf("%d to send response", stream.Mark)
+	// fmt.Printf("%d to send response", stream.Mark)
 	if err := s.sendResponse(ctx, stream, reply, cp, opts, comp); err != nil {
 		if err == io.EOF {
 			// The entire stream is done (for unary RPC only).
@@ -1623,9 +1623,9 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 			binlog.Log(ctx, st)
 		}
 	}
-	fmt.Printf("ProcessUnaryRPC: start WriteStatus\n")
+	// fmt.Printf("ProcessUnaryRPC: start WriteStatus\n")
 	err = stream.WriteStatus(statusOK)
-	fmt.Printf("ProcessUnaryRPC: finish WriteStatus\n")
+	// fmt.Printf("ProcessUnaryRPC: finish WriteStatus\n")
 	return err
 }
 
