@@ -215,17 +215,18 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		if err := framer.fr.WriteSettings(isettings...); err != nil {
 			return nil, connectionErrorf(false, err, "transport: %v", err)
 		}
+		// Adjust the connection flow control window if needed.
+		if delta := uint32(icwz - defaultWindowSize); delta > 0 {
+			if err := framer.fr.WriteWindowUpdate(0, delta); err != nil {
+				return nil, connectionErrorf(false, err, "transport: %v", err)
+			}
+		}
 	} else {
 		//if err := framer.komafr.WriteSettings(isettings...); err != nil {
 		//return nil, connectionErrorf(false, err, "transport: %v", err)
 		//}
 	}
-	// Adjust the connection flow control window if needed.
-	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
-		if err := framer.fr.WriteWindowUpdate(0, delta); err != nil {
-			return nil, connectionErrorf(false, err, "transport: %v", err)
-		}
-	}
+
 	kp := config.KeepaliveParams
 	if kp.MaxConnectionIdle == 0 {
 		kp.MaxConnectionIdle = defaultMaxConnectionIdle
@@ -1102,6 +1103,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		close(t.readerDone)
 		<-t.loopyWriterDone
 	}()
+
+	koma.KomaPull(komafd)
 	for {
 		// Rui: comment the following line because we do not need controlbuf for koma serverTransport
 		// t.controlBuf.throttle()
@@ -1109,7 +1112,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 		// Rui: komaPull which tries to pull a message from the in-kernel central queue.
 		// fmt.Printf("HandleStreamsKoma: start koma pull\n")
 		// timetrace.Record1("%d Koma Pull Start", t.framer.komafr.GetMark())
-		koma.KomaPull(komafd)
+		// koma.KomaPull(komafd)
 
 		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
 		// fmt.Printf("HandleStreamsKoma: start Reading frames\n")
@@ -1804,7 +1807,7 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 	// the following logic ic a simplified version (w/o flow control) of processData() in loopy_writer.go
 	// fmt.Printf("Write: 3\n")
 	if len(df.h) == 0 && df.reader.Remaining() == 0 {
-		//Empty data Frame
+		// Empty data Frame
 		// Client sends out empty data frame with endStream = true
 		if err := t.framer.komafr.WriteData(df.streamID, df.endStream, nil); err != nil {
 			return err
