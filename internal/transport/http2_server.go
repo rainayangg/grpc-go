@@ -454,34 +454,18 @@ func (t *http2Server) processCleanupStream(streamID uint32, rstCode http2.ErrCod
 
 // operateHeadersKoma takes action on the decoded headers. Returns an error if fatal
 // error encountered and transport needs to close, otherwise returns nil.
-func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame, tst *http2Server) (*ServerStream, error) {
-	// Acquire max stream ID lock for entire duration
-	// tst.maxStreamMu.Lock()
-	// defer tst.maxStreamMu.Unlock()
-
+func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame) (*ServerStream, error) {
 	streamID := frame.Header().StreamID
-
-	// frame.Truncated is set to true when framer detects that the current header
-	// list size hits MaxHeaderListSize limit.
 	if frame.Truncated {
 		t.processCleanupStream(streamID, http2.ErrCodeFrameSize)
 		return nil, nil
 	}
-
-	// if streamID%2 != 1 || streamID <= t.maxStreamID {
-	// 	// illegal gRPC stream id.
-	// 	return nil, fmt.Errorf("received an illegal stream id: %v. headers frame: %+v", streamID, frame)
-	// }
-	// if streamID > tst.maxStreamID {
-	// tst.maxStreamID = streamID
-	// }
-
 	buf := newRecvBuffer()
 	s := &ServerStream{
 		Stream: &Stream{
 			id:  streamID,
 			buf: buf,
-			fc:  &inFlow{limit: uint32(tst.initialWindowSize)},
+			fc:  &inFlow{limit: uint32(t.initialWindowSize)},
 		},
 		st:               t,
 		headerWireLength: int(frame.Header().Length),
@@ -537,8 +521,8 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		// "Transports must consider requests containing the Connection header
 		// as malformed." - A41
 		case "connection":
-			if tst.logger.V(logLevel) {
-				tst.logger.Infof("Received a HEADERS frame with a :connection header which makes the request malformed, as per the HTTP/2 spec")
+			if t.logger.V(logLevel) {
+				t.logger.Infof("Received a HEADERS frame with a :connection header which makes the request malformed, as per the HTTP/2 spec")
 			}
 			protocolError = true
 		default:
@@ -548,7 +532,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			v, err := decodeMetadataHeader(hf.Name, hf.Value)
 			if err != nil {
 				headerError = status.Newf(codes.Internal, "malformed binary metadata %q in header %q: %v", hf.Value, hf.Name, err)
-				tst.logger.Warningf("Failed to decode metadata header (%q, %q): %v", hf.Name, hf.Value, err)
+				t.logger.Warningf("Failed to decode metadata header (%q, %q): %v", hf.Name, hf.Value, err)
 				break
 			}
 			mdata[hf.Name] = append(mdata[hf.Name], v)
@@ -562,8 +546,8 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 	// error, this takes precedence over a client not speaking gRPC.
 	if len(mdata[":authority"]) > 1 || len(mdata["host"]) > 1 {
 		errMsg := fmt.Sprintf("num values of :authority: %v, num values of host: %v, both must only have 1 value as per HTTP/2 spec", len(mdata[":authority"]), len(mdata["host"]))
-		if tst.logger.V(logLevel) {
-			tst.logger.Infof("Aborting the stream early: %v", errMsg)
+		if t.logger.V(logLevel) {
+			t.logger.Infof("Aborting the stream early: %v", errMsg)
 		}
 		// TODO (Rui): remove this to direct koma tx.
 		eas := &earlyAbortStream{
@@ -631,30 +615,10 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 	if len(mdata) > 0 {
 		s.ctx = metadata.NewIncomingContext(s.ctx, mdata)
 	}
-	// tst.mu.Lock()
-	// if tst.state != reachable {
-	// 	tst.mu.Unlock()
-	// 	s.cancel()
-	// 	return s, nil
-	// }
-
-	// TODO (Rui): move to kernel
-	// if uint32(len(tst.activeStreams)) >= tst.maxStreams {
-	// 	tst.mu.Unlock()
-	// 	tst.controlBuf.put(&cleanupStream{
-	// 		streamID: streamID,
-	// 		rst:      true,
-	// 		rstCode:  http2.ErrCodeRefusedStream,
-	// 		onWrite:  func() {},
-	// 	})
-	// 	s.cancel()
-	// 	return s, nil
-	// }
 	if httpMethod != http.MethodPost {
-		tst.mu.Unlock()
 		errMsg := fmt.Sprintf("Received a HEADERS frame with :method %q which should be POST", httpMethod)
-		if tst.logger.V(logLevel) {
-			tst.logger.Infof("Aborting the stream early: %v", errMsg)
+		if t.logger.V(logLevel) {
+			t.logger.Infof("Aborting the stream early: %v", errMsg)
 		}
 		eas := &earlyAbortStream{
 			httpStatus:     http.StatusMethodNotAllowed,
@@ -667,57 +631,26 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		s.cancel()
 		return s, nil
 	}
-	// if tst.inTapHandle != nil {
-	// 	var err error
-	// 	if s.ctx, err = tst.inTapHandle(s.ctx, &tap.Info{FullMethodName: s.method, Header: mdata}); err != nil {
-	// 		tst.mu.Unlock()
-	// 		if tst.logger.V(logLevel) {
-	// 			tst.logger.Infof("Aborting the stream early due to InTapHandle failure: %v", err)
-	// 		}
-	// 		stat, ok := status.FromError(err)
-	// 		if !ok {
-	// 			stat = status.New(codes.PermissionDenied, err.Error())
-	// 		}
-	// 		eas := &earlyAbortStream{
-	// 			httpStatus:     http.StatusOK,
-	// 			streamID:       s.id,
-	// 			contentSubtype: s.contentSubtype,
-	// 			status:         stat,
-	// 			rst:            !frame.StreamEnded(),
-	// 		}
-	// 		t.processEarlyAbortStream(eas)
-	// 		return s, nil
+
+	// // Start a timer to close the stream on reaching the deadline.
+	// if timeoutSet {
+	// 	// We need to wait for s.cancel to be updated before calling
+	// 	// t.closeStream to avoid data races.
+	// 	cancelUpdated := make(chan struct{})
+	// 	timer := internal.TimeAfterFunc(timeout, func() {
+	// 		<-cancelUpdated
+	// 		t.closeStream(s, true, http2.ErrCodeCancel, false)
+	// 		fmt.Printf("Koma socket stream %d timed out after %v\n", s.id, timeout)
+	// 	})
+	// 	oldCancel := s.cancel
+	// 	s.cancel = func() {
+	// 		oldCancel()
+	// 		timer.Stop()
 	// 	}
+	// 	close(cancelUpdated)
 	// }
-	// tst.activeStreams[streamID] = s
-	// if len(tst.activeStreams) == 1 {
-	// 	tst.idle = time.Time{}
-	// }
-	// Start a timer to close the stream on reaching the deadline.
-	if timeoutSet {
-		// We need to wait for s.cancel to be updated before calling
-		// t.closeStream to avoid data races.
-		cancelUpdated := make(chan struct{})
-		timer := internal.TimeAfterFunc(timeout, func() {
-			<-cancelUpdated
-			tst.closeStream(s, true, http2.ErrCodeCancel, false)
-			fmt.Printf("Koma socket stream %d timed out after %v\n", s.id, timeout)
-		})
-		oldCancel := s.cancel
-		s.cancel = func() {
-			oldCancel()
-			timer.Stop()
-		}
-		close(cancelUpdated)
-	}
-	// tst.mu.Unlock()
-	// if channelz.IsOn() {
-	// 	tst.channelz.SocketMetrics.StreamsStarted.Add(1)
-	// 	tst.channelz.SocketMetrics.LastRemoteStreamCreatedTimestamp.Store(time.Now().UnixNano())
-	// }
-	s.requestRead = func(n int) {
-		// tst.adjustWindow(s, uint32(n))
-	}
+
+	s.requestRead = func(n int) {}
 	s.ctxDone = s.ctx.Done()
 	s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
 	s.trReader = &transportReader{
@@ -726,15 +659,8 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			ctxDone: s.ctxDone,
 			recv:    s.buf,
 		},
-		windowHandler: func(n int) {
-			// tst.updateWindow(s, uint32(n))
-		},
+		windowHandler: func(n int) {},
 	}
-	// Register the stream with loopy.
-	// tst.controlBuf.put(&registerStream{
-	// 	streamID: s.id,
-	// 	wq:       s.wq,
-	// })
 	return s, nil
 }
 
@@ -1106,16 +1032,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 
 	koma.KomaPull(komafd)
 	for {
-		// Rui: comment the following line because we do not need controlbuf for koma serverTransport
-		// t.controlBuf.throttle()
-
-		// Rui: komaPull which tries to pull a message from the in-kernel central queue.
-		// fmt.Printf("HandleStreamsKoma: start koma pull\n")
-		// timetrace.Record1("%d Koma Pull Start", t.framer.komafr.GetMark())
-		// koma.KomaPull(komafd)
-
-		// Rui: koma reads a full stream (consists of multiple frames) in one go, so it calls ReadFrames()
-		// fmt.Printf("HandleStreamsKoma: start Reading frames\n")
 		frames, err := t.framer.komafr.ReadFrames()
 		// timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
 		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
@@ -1126,32 +1042,17 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 			continue
 		}
 
-		// Rui: lookup the connMap to locate the st for the tcp connection
-		remoteAddr := t.framer.komafr.KomaSocket.RemoteAddr().String()
-		val, ok := m.Load(remoteAddr)
-		if !ok {
-			fmt.Printf("connection %s not found in the map!\n", remoteAddr)
-			// Print all key-value pairs
-			m.Range(func(key, value any) bool {
-				fmt.Printf("%v: %v\n", key, value)
-				return true // continue iteration
-			})
-			return
-		}
-		tcpSt := val.(*http2Server)
-		// fmt.Printf("HandleStreamsKoma: Get associated TCP connection\n")
-
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+
 		if err != nil {
 			if _, ok := err.(http2.StreamError); ok {
 				fmt.Printf("Write RST stream for %d", frames[0].Header().StreamID)
-				tcpSt.framer.fr.WriteRSTStream(frames[0].Header().StreamID, err.(http2.StreamError).Code)
+				t.framer.komafr.WriteRSTStream(frames[0].Header().StreamID, err.(http2.StreamError).Code)
 				continue
 			}
-			tcpSt.Close(err)
+			t.Close(err)
 			return
 		}
-
 		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
 		// fmt.Printf("HandleStreamsKoma: start processing frames\n")
 		var stream *ServerStream
@@ -1160,19 +1061,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 			switch frame := frame.(type) {
 			case *http2.MetaHeadersFrame:
 				ifNewStream = true
-				// fmt.Printf("HandleStreamsKoma: !MetaHeadersFrame\n")
-				// s, err := tcpSt.operateHeaders(ctx, frame, func(*ServerStream) {})
-				s, err := t.operateHeadersKoma(ctx, frame, tcpSt)
+				s, err := t.operateHeadersKoma(ctx, frame)
 				if err != nil {
-					// Any error processing client headers, e.g. invalid stream ID,
-					// is considered a protocol violation.
-					// TODO (Rui): disable this goAway contorlBuf. the associated handler is
-					// func (t *http2Server) outgoingGoAwayHandler(g *goAway)
-					tcpSt.controlBuf.put(&goAway{
-						code:      http2.ErrCodeProtocol,
-						debugData: []byte(err.Error()),
-						closeConn: err,
-					})
 					continue
 				}
 				stream = s
@@ -1180,20 +1070,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 			case *http2.DataFrame:
 				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
 				t.handleDataKoma(frame, stream)
-			case *http2.RSTStreamFrame:
-				// fmt.Printf("HandleStreamsKoma: !RSTStreamFrame\n")
-				tcpSt.handleRSTStream(frame)
-			case *http2.SettingsFrame:
-				// fmt.Printf("HandleStreamsKoma: !SettingsFrame\n")
-				tcpSt.handleSettings(frame)
-			case *http2.PingFrame:
-				// fmt.Printf("HandleStreamsKoma: !PingFrame\n")
-				tcpSt.handlePing(frame)
-			case *http2.WindowUpdateFrame:
-				// fmt.Printf("HandleStreamsKoma: !WindowUpdateFrame\n")
-				tcpSt.handleWindowUpdate(frame)
-			case *http2.GoAwayFrame:
-				// TODO: Handle GoAway from the client appropriately.
 			default:
 				if t.logger.V(logLevel) {
 					t.logger.Infof("Received unsupported frame type %T", frame)
@@ -1201,7 +1077,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd
 
 			}
 		}
-
 		// Rui: finish processing frames of the current stream, call handlestream to do rpc-level processing.
 		// In the original gRPC setting, whenever a new stream is detected (from `MetaHeaderFrame`), the handle function
 		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
