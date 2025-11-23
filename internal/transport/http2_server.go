@@ -1066,7 +1066,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 					continue
 				}
 				stream = s
-				stream.Mark = t.framer.komafr.GetMark()
+				// stream.Mark = t.framer.komafr.GetMark()
 			case *http2.DataFrame:
 				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
 				t.handleDataKoma(frame, stream)
