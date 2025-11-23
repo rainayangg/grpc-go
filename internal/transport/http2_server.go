@@ -1024,7 +1024,7 @@ func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStre
 }
 
 // HandleStreamsKoma receives incoming streams. The difference from the default one is that we do not give them to any handler directly. Instead, the handler function is called directly in serverWorker().
-func (t *http2Server) HandleStreamsKoma(ctx context.Context, m *sync.Map, komafd int, handle func(*ServerStream)) {
+func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle func(*ServerStream)) {
 	defer func() {
 		close(t.readerDone)
 		<-t.loopyWriterDone

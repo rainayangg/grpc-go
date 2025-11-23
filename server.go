@@ -156,8 +156,6 @@ type Server struct {
 	// TODO(Rui): grpc-koma does not need ebpf program anyway, to be removed after the bpf part is removed in the koma code
 	komafds []int // all koma sockets belonging to this server
 
-	// Rui: @connMap stores the mapping between a tcp connection key and the serverTransport of this TCP connection.
-	connMap sync.Map
 }
 
 type serverOptions struct {
@@ -659,7 +657,7 @@ func (s *Server) serverWorker() {
 	s.mu.Lock()
 	s.komafds = append(s.komafds, komafd)
 	s.mu.Unlock()
-	komaConn, _ := http2.NewKomaConn(komafd, &s.connMap)
+	komaConn, _ := http2.NewKomaConn(komafd)
 
 	// create a dedicated new transport for the koma connection, note that it is
 	// different from the serverTransport of a normal TCP connection
@@ -682,7 +680,7 @@ func (s *Server) serverWorker() {
 	}()
 
 	// streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
-	st.HandleStreamsKoma(ctx, &s.connMap, int(komafd), func(stream *transport.ServerStream) {
+	st.HandleStreamsKoma(ctx, int(komafd), func(stream *transport.ServerStream) {
 		// fmt.Printf("HandleStreamsKoma: start handling stream!!!\n")
 		// s.handlersWG.Add(1)
 		// streamQuota.acquire()
@@ -1026,11 +1024,6 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	fd, _ := GetFdFromTCPConn(rawConn)
 	fmt.Printf("create a new HTTP transport for TCP connection %d\n", fd)
 	st := s.newHTTP2Transport(rawConn, false)
-
-	// Rui: store the accepted TCP connection in the map of the server.
-	tcpAddr := rawConn.RemoteAddr().(*net.TCPAddr)
-	key := string(fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port))
-	s.connMap.Store(key, st)
 
 	fd, ferr := GetFdFromTCPConn(rawConn)
 	if ferr != nil {
