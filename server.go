@@ -56,6 +56,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
 	// "google.golang.org/grpc/timetrace"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -635,24 +636,30 @@ func bufferPool(bufferPool mem.BufferPool) ServerOption {
 // workload (assuming a QPS of a few thousand requests/sec).
 const serverWorkerResetThreshold = 1 << 16
 
+func PinThreadToCPU(cpuID int) error {
+	tid := unix.Gettid()
+	var cpuset unix.CPUSet
+	cpuset.Zero()
+	cpuset.Set(cpuID)
+	return unix.SchedSetaffinity(tid, &cpuset)
+}
+
 // serverWorker blocks on a *transport.ServerStream channel forever and waits
 // for data to be fed by serveStreams. This allows multiple requests to be
 // processed by the same goroutine, removing the need for expensive stack
 // re-allocations (see the runtime.morestack problem [1]).
 //
 // [1] https://github.com/golang/go/issues/18138
-func (s *Server) serverWorker() {
-	//for completed := 0; completed < serverWorkerResetThreshold; completed++ {
-	//f, ok := <-s.serverWorkerChannel
-	//if !ok {
-	//return
-	//}
-	//f()
-	//}
-	//go s.serverWorker()
+func (s *Server) serverWorker(workerID int, cpuID int) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := PinThreadToCPU(cpuID); err != nil {
+		panic(err)
+	}
+	fmt.Printf("worker %d on linux cpu %d\n", workerID, cpuID)
+
 	komafd := koma.KomaInit()
 	fmt.Printf("Initialize KOMA socket %d\n", komafd)
-
 	// TODO(Rui): locking here for concurrent access to the shared list of all koma fds
 	s.mu.Lock()
 	s.komafds = append(s.komafds, komafd)
@@ -694,12 +701,13 @@ func (s *Server) serverWorker() {
 // initServerWorkers creates worker goroutines and a channel to process incoming
 // connections to reduce the time spent overall on runtime.morestack.
 func (s *Server) initServerWorkers() {
+	coreList := []int{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
 	s.serverWorkerChannel = make(chan func())
 	s.serverWorkerChannelClose = sync.OnceFunc(func() {
 		close(s.serverWorkerChannel)
 	})
-	for i := uint32(0); i < s.opts.numServerWorkers; i++ {
-		go s.serverWorker()
+	for i := 0; i < int(s.opts.numServerWorkers); i++ {
+		go s.serverWorker(i, coreList[i%len(coreList)])
 	}
 }
 
