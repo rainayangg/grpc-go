@@ -45,7 +45,7 @@ import (
 	// "google.golang.org/grpc/timetrace"
 	"google.golang.org/protobuf/proto"
 
-	"golang.org/x/sys/unix"
+	// "golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal/channelz"
@@ -1032,34 +1032,34 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 	}()
 
 	// --- epoll setup (manual polling, no GO netpoll) ---
-	epfd, err := unix.EpollCreate1(0)
-	if err != nil {
-		fmt.Printf("EpollCreate1 error: %v\n", err)
-		return
-	}
-	defer unix.Close(epfd)
+	// epfd, err := unix.EpollCreate1(0)
+	// if err != nil {
+	// 	fmt.Printf("EpollCreate1 error: %v\n", err)
+	// 	return
+	// }
+	// defer unix.Close(epfd)
 
-	ev := &unix.EpollEvent{
-		Events: unix.EPOLLIN,
-		Fd:     int32(komafd),
-	}
+	// ev := &unix.EpollEvent{
+	// 	Events: unix.EPOLLIN,
+	// 	Fd:     int32(komafd),
+	// }
 
-	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, komafd, ev); err != nil {
-		t.Close(fmt.Errorf("epoll ctl add komafd=%d: %w", komafd, err))
-		return
-	}
-	events := make([]unix.EpollEvent, 64)
+	// if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, komafd, ev); err != nil {
+	// 	t.Close(fmt.Errorf("epoll ctl add komafd=%d: %w", komafd, err))
+	// 	return
+	// }
+	// events := make([]unix.EpollEvent, 64)
 
 	koma.KomaPull(komafd)
 	for {
-		_, err := unix.EpollWait(epfd, events, -1)
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			t.Close(fmt.Errorf("epoll wait %w", err))
-			return
-		}
+		// _, err := unix.EpollWait(epfd, events, -1)
+		// if err == unix.EINTR {
+		// 	continue
+		// }
+		// if err != nil {
+		// 	t.Close(fmt.Errorf("epoll wait %w", err))
+		// 	return
+		// }
 
 		frames, err := t.framer.komafr.ReadFrames()
 		// timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
