@@ -387,34 +387,6 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 
 	}
 
-	// Rui: LoopyWriter is only needed for rawTCP (send messages back to the students in the TX path),
-	// but unnecessary for the koma connection, as we decided not to use Koma TX path.
-	// if !ifkoma {
-	// 	go func() {
-	// 		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger, t.outgoingGoAwayHandler, t.bufferPool)
-	// 		err := t.loopy.run()
-	// 		close(t.loopyWriterDone)
-	// 		if !isIOError(err) {
-	// 			// Close the connection if a non-I/O error occurs (for I/O errors
-	// 			// the reader will also encounter the error and close).  Wait 1
-	// 			// second before closing the connection, or when the reader is done
-	// 			// (i.e. the client already closed the connection or a connection
-	// 			// error occurred).  This avoids the potential problem where there
-	// 			// is unread data on the receive side of the connection, which, if
-	// 			// closed, would lead to a TCP RST instead of FIN, and the client
-	// 			// encountering errors.  For more info:
-	// 			// https://github.com/grpc/grpc-go/issues/5358
-	// 			timer := time.NewTimer(time.Second)
-	// 			defer timer.Stop()
-	// 			select {
-	// 			case <-t.readerDone:
-	// 			case <-timer.C:
-	// 			}
-	// 			t.conn.Close()
-	// 		}
-	// 	}()
-	// 	go t.keepalive()
-	// }
 	return t, nil
 }
 
@@ -461,17 +433,16 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		t.processCleanupStream(streamID, http2.ErrCodeFrameSize)
 		return nil, nil
 	}
-
+	buf := newRecvBuffer()
 	s := &ServerStream{
 		Stream: &Stream{
-			id: streamID,
-			// buf: nil, // Rui: we don't need a buffer in koma socket
-			// fc:  &inFlow{limit: uint32(t.initialWindowSize)}, // inbound flow control not used
+			id:  streamID,
+			buf: buf,
+			fc:  &inFlow{limit: uint32(t.initialWindowSize)},
 		},
 		st:               t,
 		headerWireLength: int(frame.Header().Length),
 	}
-
 	var (
 		// if false, content-type was missing or invalid
 		isGRPC      = false
@@ -559,6 +530,10 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		_ = timeout
 	}
 
+	s.ctx = ctx
+	s.cancel = func() {}
+	s.ctxDone = nil
+
 	if httpMethod != http.MethodPost {
 		errMsg := fmt.Sprintf("Received a HEADERS frame with :method %q which should be POST", httpMethod)
 		if t.logger.V(logLevel) {
@@ -576,13 +551,13 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		return s, nil
 	}
 
-	s.ctx = ctx
-	s.cancel = func() {}
-	s.ctxDone = nil
 	s.requestRead = func(n int) {}
-
-	// s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
-
+	s.trReader = &transportReader{
+		reader: &recvBufferReader{
+			recv: s.buf,
+		},
+		windowHandler: func(n int) {},
+	}
 	return s, nil
 }
 
@@ -1027,10 +1002,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 
 			}
 		}
-		stream.trReader = &transportReader{
-			kreader:       newKomaUnaryReader(stream.komaBufs[0]),
-			windowHandler: func(n int) {},
-		}
 		// Rui: finish processing frames of the current stream, call handlestream to do rpc-level processing.
 		// In the original gRPC setting, whenever a new stream is detected (from `MetaHeaderFrame`), the handle function
 		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
@@ -1107,12 +1078,11 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 	size := f.Header().Length
 	if size > 0 {
 		if len(f.Data()) > 0 {
-			s.komaBufs = append(s.komaBufs, &mem.KomaBuffer{Data: f.Data()})
+			s.write(recvMsg{buffer: &mem.KomaBuffer{Data: f.Data()}})
 		}
 	}
 	if f.StreamEnded() {
-		// Received the end of stream from the client.
-		s.komaEOF = true
+		s.write(recvMsg{err: io.EOF})
 	}
 }
 
