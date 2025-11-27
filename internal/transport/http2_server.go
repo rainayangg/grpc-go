@@ -387,6 +387,34 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 
 	}
 
+	// Rui: LoopyWriter is only needed for rawTCP (send messages back to the students in the TX path),
+	// but unnecessary for the koma connection, as we decided not to use Koma TX path.
+	// if !ifkoma {
+	// 	go func() {
+	// 		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger, t.outgoingGoAwayHandler, t.bufferPool)
+	// 		err := t.loopy.run()
+	// 		close(t.loopyWriterDone)
+	// 		if !isIOError(err) {
+	// 			// Close the connection if a non-I/O error occurs (for I/O errors
+	// 			// the reader will also encounter the error and close).  Wait 1
+	// 			// second before closing the connection, or when the reader is done
+	// 			// (i.e. the client already closed the connection or a connection
+	// 			// error occurred).  This avoids the potential problem where there
+	// 			// is unread data on the receive side of the connection, which, if
+	// 			// closed, would lead to a TCP RST instead of FIN, and the client
+	// 			// encountering errors.  For more info:
+	// 			// https://github.com/grpc/grpc-go/issues/5358
+	// 			timer := time.NewTimer(time.Second)
+	// 			defer timer.Stop()
+	// 			select {
+	// 			case <-t.readerDone:
+	// 			case <-timer.C:
+	// 			}
+	// 			t.conn.Close()
+	// 		}
+	// 	}()
+	// 	go t.keepalive()
+	// }
 	return t, nil
 }
 
@@ -530,9 +558,10 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		_ = timeout
 	}
 
+	// Minimal context setup for Koma
 	s.ctx = ctx
 	s.cancel = func() {}
-	s.ctxDone = nil
+	s.ctxDone = s.ctx.Done() // this is now safe
 
 	if httpMethod != http.MethodPost {
 		errMsg := fmt.Sprintf("Received a HEADERS frame with :method %q which should be POST", httpMethod)
@@ -1082,6 +1111,7 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 		}
 	}
 	if f.StreamEnded() {
+		s.state = streamReadDone
 		s.write(recvMsg{err: io.EOF})
 	}
 }
