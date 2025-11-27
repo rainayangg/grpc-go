@@ -584,7 +584,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 	s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
 
 	s.trReader = &transportReader{
-		reader:        &komaUnaryReader{s: s, off: 0, headerDone: false},
+		reader:        &komaUnaryReader{s: s},
 		windowHandler: func(n int) {},
 	}
 	return s, nil
@@ -1107,7 +1107,7 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 	size := f.Header().Length
 	if size > 0 {
 		if len(f.Data()) > 0 {
-			s.komaBody = append(s.komaBody, f.Data()...)
+			s.komaBufs = append(s.komaBufs, &mem.KomaBuffer{Data: f.Data()})
 		}
 	}
 	if f.StreamEnded() {

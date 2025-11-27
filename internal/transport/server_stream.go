@@ -52,7 +52,7 @@ type ServerStream struct {
 	headerSent atomic.Bool // atomically set when the headers are sent out.
 
 	// koma related
-	komaBody []byte
+	komaBufs []mem.Buffer
 	komaEOF  bool
 }
 

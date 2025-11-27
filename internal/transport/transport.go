@@ -58,54 +58,77 @@ type payloadReader interface {
 // It reads from s.komaBody, which contains the complete DATA payload of the
 // stream (gRPC message header + message body).
 type komaUnaryReader struct {
-	s          *ServerStream
-	off        int  // current offset into s.komaBody
-	headerDone bool // whether we've already returned the 5-byte gRPC header
+	s    *ServerStream
+	last mem.Buffer // leftover from previous read (like recvBufferReader.last)
+	idx  int        // index into s.komaBufs
+}
+
+func (r *komaUnaryReader) nextBuffer() (mem.Buffer, error) {
+	if r.last != nil {
+		b := r.last
+		r.last = nil
+		return b, nil
+	}
+	if r.idx >= len(r.s.komaBufs) {
+		// No more data available.
+		// If this happens before we've satisfied the requested length,
+		// the higher layer will see io.EOF and convert to ErrUnexpectedEOF.
+		return nil, io.EOF
+	}
+	b := r.s.komaBufs[r.idx]
+	r.idx++
+	return b, nil
 }
 
 func (r *komaUnaryReader) ReadMessageHeader(header []byte) (int, error) {
-	if r.headerDone {
-		// No second message expected in unary fast path.
-		return 0, io.EOF
-	}
 	if len(header) == 0 {
 		return 0, nil
 	}
-	if len(r.s.komaBody)-r.off < len(header) {
-		// In Koma run-to-completion, by the time the handler starts reading,
-		// all DATA should already be present. If it's not, treat as bad.
-		if len(r.s.komaBody)-r.off == 0 {
-			return 0, io.EOF
-		}
-		return 0, io.ErrUnexpectedEOF
+
+	// Same pattern as recvBufferReader: first consume from last, then next buffer.
+	if r.last != nil {
+		n, rest := mem.ReadUnsafe(header, r.last)
+		r.last = rest
+		return n, nil
 	}
 
-	copy(header, r.s.komaBody[r.off:r.off+len(header)])
-	r.off += len(header)
-	r.headerDone = true
-	return len(header), nil
+	b, err := r.nextBuffer()
+	if err != nil {
+		return 0, err
+	}
+	n, rest := mem.ReadUnsafe(header, b)
+	r.last = rest
+	return n, nil
 }
 
 func (r *komaUnaryReader) Read(n int) (mem.Buffer, error) {
 	if n <= 0 {
 		return nil, nil
 	}
-	remain := len(r.s.komaBody) - r.off
-	if remain == 0 {
-		// No more data. For unary, this is EOF; the higher layers are
-		// responsible for not over-reading.
-		return nil, io.EOF
+
+	if r.last != nil {
+		buf := r.last
+		if buf.Len() > n {
+			var rem mem.Buffer
+			buf, rem = mem.SplitUnsafe(buf, n)
+			r.last = rem
+		} else {
+			r.last = nil
+		}
+		return buf, nil
 	}
 
-	if n > remain {
-		n = remain
+	b, err := r.nextBuffer()
+	if err != nil {
+		return nil, err
 	}
 
-	// mem.KomaBuffer is your Koma-specific mem.Buffer implementation.
-	// This allocates a thin wrapper over the sub-slice; no copying needed
-	// if KomaBuffer just stores the slice.
-	b := &mem.KomaBuffer{Data: r.s.komaBody[r.off : r.off+n]}
-	r.off += n
+	if b.Len() > n {
+		var rem mem.Buffer
+		b, rem = mem.SplitUnsafe(b, n)
+		r.last = rem
+	}
+
 	return b, nil
 }
 
