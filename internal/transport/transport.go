@@ -54,82 +54,64 @@ type payloadReader interface {
 	Read(n int) (mem.Buffer, error)
 }
 
-// komaUnaryReader implements payloadReader for the Koma unary fast path.
-// It reads from s.komaBody, which contains the complete DATA payload of the
-// stream (gRPC message header + message body).
+// komaUnaryReader is a zero-overhead drop-in replacement for recvBufferReader
+// for the Koma fast path. It assumes a single contiguous mem.Buffer containing
+// the full DATA frame (5-byte gRPC header + message body).
 type komaUnaryReader struct {
-	s    *ServerStream
-	last mem.Buffer // leftover from previous read (like recvBufferReader.last)
-	idx  int        // index into s.komaBufs
+	last mem.Buffer // same meaning as recvBufferReader.last
+	buf  mem.Buffer // the original full buffer (only used at first read)
+	err  error      // sticky error, same semantics as recvBufferReader
+	used bool       // whether buf was consumed once
 }
 
-func (r *komaUnaryReader) nextBuffer() (mem.Buffer, error) {
-	if r.last != nil {
-		b := r.last
-		r.last = nil
-		return b, nil
-	}
-	if r.idx >= len(r.s.komaBufs) {
-		// No more data available.
-		// If this happens before we've satisfied the requested length,
-		// the higher layer will see io.EOF and convert to ErrUnexpectedEOF.
-		return nil, io.EOF
-	}
-	b := r.s.komaBufs[r.idx]
-	r.idx++
-	return b, nil
+func newKomaUnaryReader(b mem.Buffer) *komaUnaryReader {
+	return &komaUnaryReader{buf: b}
 }
 
 func (r *komaUnaryReader) ReadMessageHeader(header []byte) (int, error) {
-	if len(header) == 0 {
-		return 0, nil
+	if r.err != nil {
+		return 0, r.err
 	}
-
-	// Same pattern as recvBufferReader: first consume from last, then next buffer.
+	// If we have leftover bytes from previous read, use them.
 	if r.last != nil {
 		n, rest := mem.ReadUnsafe(header, r.last)
 		r.last = rest
 		return n, nil
 	}
-
-	b, err := r.nextBuffer()
-	if err != nil {
-		return 0, err
+	// First read: consume from the full buffer.
+	if !r.used {
+		n, rest := mem.ReadUnsafe(header, r.buf)
+		r.last = rest
+		r.used = true
+		return n, nil
 	}
-	n, rest := mem.ReadUnsafe(header, b)
-	r.last = rest
-	return n, nil
+
+	// No more data in unary.
+	r.err = io.EOF
+	return 0, r.err
 }
 
 func (r *komaUnaryReader) Read(n int) (mem.Buffer, error) {
-	if n <= 0 {
-		return nil, nil
+	if r.err != nil {
+		return nil, r.err
 	}
 
+	// Same pattern: serve from r.last
 	if r.last != nil {
-		buf := r.last
-		if buf.Len() > n {
+		b := r.last
+		if b.Len() > n {
 			var rem mem.Buffer
-			buf, rem = mem.SplitUnsafe(buf, n)
+			b, rem = mem.SplitUnsafe(b, n)
 			r.last = rem
 		} else {
 			r.last = nil
 		}
-		return buf, nil
+		return b, nil
 	}
 
-	b, err := r.nextBuffer()
-	if err != nil {
-		return nil, err
-	}
-
-	if b.Len() > n {
-		var rem mem.Buffer
-		b, rem = mem.SplitUnsafe(b, n)
-		r.last = rem
-	}
-
-	return b, nil
+	// No more data → EOF
+	r.err = io.EOF
+	return nil, r.err
 }
 
 // recvMsg represents the received msg from the transport. All transport
@@ -493,8 +475,9 @@ func (s *Stream) read(n int) (data mem.BufferSlice, err error) {
 // The error is io.EOF when the stream is done or another non-nil error if
 // the stream broke.
 type transportReader struct {
-	// reader *recvBufferReader
-	reader payloadReader
+	reader *recvBufferReader
+	// reader payloadReader
+	kreader *komaUnaryReader
 	// The handler to control the window update procedure for both this
 	// particular stream and the associated transport.
 	windowHandler func(int)
@@ -502,7 +485,7 @@ type transportReader struct {
 }
 
 func (t *transportReader) ReadMessageHeader(header []byte) (int, error) {
-	n, err := t.reader.ReadMessageHeader(header)
+	n, err := t.kreader.ReadMessageHeader(header)
 	if err != nil {
 		t.er = err
 		return 0, err
@@ -512,7 +495,7 @@ func (t *transportReader) ReadMessageHeader(header []byte) (int, error) {
 }
 
 func (t *transportReader) Read(n int) (mem.Buffer, error) {
-	buf, err := t.reader.Read(n)
+	buf, err := t.kreader.Read(n)
 	if err != nil {
 		t.er = err
 		return buf, err

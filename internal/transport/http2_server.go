@@ -581,12 +581,8 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 	s.ctxDone = nil
 	s.requestRead = func(n int) {}
 
-	s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
+	// s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
 
-	s.trReader = &transportReader{
-		reader:        &komaUnaryReader{s: s},
-		windowHandler: func(n int) {},
-	}
 	return s, nil
 }
 
@@ -1030,6 +1026,10 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 				}
 
 			}
+		}
+		stream.trReader = &transportReader{
+			kreader:       newKomaUnaryReader(stream.komaBufs[0]),
+			windowHandler: func(n int) {},
 		}
 		// Rui: finish processing frames of the current stream, call handlestream to do rpc-level processing.
 		// In the original gRPC setting, whenever a new stream is detected (from `MetaHeaderFrame`), the handle function
