@@ -461,22 +461,23 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		t.processCleanupStream(streamID, http2.ErrCodeFrameSize)
 		return nil, nil
 	}
-	buf := newRecvBuffer()
+
 	s := &ServerStream{
 		Stream: &Stream{
-			id:  streamID,
-			buf: buf,
-			fc:  &inFlow{limit: uint32(t.initialWindowSize)},
+			id: streamID,
+			// buf: nil, // Rui: we don't need a buffer in koma socket
+			// fc:  &inFlow{limit: uint32(t.initialWindowSize)}, // inbound flow control not used
 		},
 		st:               t,
 		headerWireLength: int(frame.Header().Length),
 	}
+
 	var (
 		// if false, content-type was missing or invalid
 		isGRPC      = false
 		contentType = ""
-		mdata       = make(metadata.MD, len(frame.Fields))
-		httpMethod  string
+
+		httpMethod string
 		// these are set if an error is encountered while parsing the headers
 		protocolError bool
 		headerError   *status.Status
@@ -493,12 +494,10 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 				contentType = hf.Value
 				break
 			}
-			mdata[hf.Name] = append(mdata[hf.Name], hf.Value)
 			s.contentSubtype = contentSubtype
 			isGRPC = true
 
 		case "grpc-accept-encoding":
-			mdata[hf.Name] = append(mdata[hf.Name], hf.Value)
 			if hf.Value == "" {
 				continue
 			}
@@ -513,12 +512,6 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			httpMethod = hf.Value
 		case ":path":
 			s.method = hf.Value
-		case "grpc-timeout":
-			timeoutSet = true
-			var err error
-			if timeout, err = decodeTimeout(hf.Value); err != nil {
-				headerError = status.Newf(codes.Internal, "malformed grpc-timeout: %v", err)
-			}
 		// "Transports must consider requests containing the Connection header
 		// as malformed." - A41
 		case "connection":
@@ -527,39 +520,8 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			}
 			protocolError = true
 		default:
-			if isReservedHeader(hf.Name) && !isWhitelistedHeader(hf.Name) {
-				break
-			}
-			v, err := decodeMetadataHeader(hf.Name, hf.Value)
-			if err != nil {
-				headerError = status.Newf(codes.Internal, "malformed binary metadata %q in header %q: %v", hf.Value, hf.Name, err)
-				t.logger.Warningf("Failed to decode metadata header (%q, %q): %v", hf.Name, hf.Value, err)
-				break
-			}
-			mdata[hf.Name] = append(mdata[hf.Name], v)
+			// KOMA: ignore other headers for koma socket for now.
 		}
-	}
-
-	// "If multiple Host headers or multiple :authority headers are present, the
-	// request must be rejected with an HTTP status code 400 as required by Host
-	// validation in RFC 7230 §5.4, gRPC status code INTERNAL, or RST_STREAM
-	// with HTTP/2 error code PROTOCOL_ERROR." - A41. Since this is a HTTP/2
-	// error, this takes precedence over a client not speaking gRPC.
-	if len(mdata[":authority"]) > 1 || len(mdata["host"]) > 1 {
-		errMsg := fmt.Sprintf("num values of :authority: %v, num values of host: %v, both must only have 1 value as per HTTP/2 spec", len(mdata[":authority"]), len(mdata["host"]))
-		if t.logger.V(logLevel) {
-			t.logger.Infof("Aborting the stream early: %v", errMsg)
-		}
-		// TODO (Rui): remove this to direct koma tx.
-		eas := &earlyAbortStream{
-			httpStatus:     http.StatusBadRequest,
-			streamID:       streamID,
-			contentSubtype: s.contentSubtype,
-			status:         status.New(codes.Internal, errMsg),
-			rst:            !frame.StreamEnded(),
-		}
-		t.processEarlyAbortStream(eas)
-		return s, nil
 	}
 
 	if protocolError {
@@ -589,33 +551,14 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		return s, nil
 	}
 
-	// "If :authority is missing, Host must be renamed to :authority." - A41
-	if len(mdata[":authority"]) == 0 {
-		// No-op if host isn't present, no eventual :authority header is a valid
-		// RPC.
-		if host, ok := mdata["host"]; ok {
-			mdata[":authority"] = host
-			delete(mdata, "host")
-		}
-	} else {
-		// "If :authority is present, Host must be discarded" - A41
-		delete(mdata, "host")
-	}
-
 	if frame.StreamEnded() {
 		// s is just created by the caller. No lock needed.
 		s.state = streamReadDone
 	}
 	if timeoutSet {
-		s.ctx, s.cancel = context.WithTimeout(ctx, timeout)
-	} else {
-		s.ctx, s.cancel = context.WithCancel(ctx)
+		_ = timeout
 	}
 
-	// Attach the received metadata to the context.
-	if len(mdata) > 0 {
-		s.ctx = metadata.NewIncomingContext(s.ctx, mdata)
-	}
 	if httpMethod != http.MethodPost {
 		errMsg := fmt.Sprintf("Received a HEADERS frame with :method %q which should be POST", httpMethod)
 		if t.logger.V(logLevel) {
@@ -633,33 +576,15 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		return s, nil
 	}
 
-	// // Start a timer to close the stream on reaching the deadline.
-	// if timeoutSet {
-	// 	// We need to wait for s.cancel to be updated before calling
-	// 	// t.closeStream to avoid data races.
-	// 	cancelUpdated := make(chan struct{})
-	// 	timer := internal.TimeAfterFunc(timeout, func() {
-	// 		<-cancelUpdated
-	// 		t.closeStream(s, true, http2.ErrCodeCancel, false)
-	// 		fmt.Printf("Koma socket stream %d timed out after %v\n", s.id, timeout)
-	// 	})
-	// 	oldCancel := s.cancel
-	// 	s.cancel = func() {
-	// 		oldCancel()
-	// 		timer.Stop()
-	// 	}
-	// 	close(cancelUpdated)
-	// }
-
+	s.ctx = ctx
+	s.cancel = func() {}
+	s.ctxDone = nil
 	s.requestRead = func(n int) {}
-	s.ctxDone = s.ctx.Done()
+
 	s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
+
 	s.trReader = &transportReader{
-		reader: &recvBufferReader{
-			ctx:     s.ctx,
-			ctxDone: s.ctxDone,
-			recv:    s.buf,
-		},
+		reader:        &komaUnaryReader{s: s, off: 0, headerDone: false},
 		windowHandler: func(n int) {},
 	}
 	return s, nil
@@ -1180,65 +1105,14 @@ func (t *http2Server) updateFlowControl(n uint32) {
 
 func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 	size := f.Header().Length
-	// var sendBDPPing bool
-	// if t.bdpEst != nil {
-	// 	sendBDPPing = t.bdpEst.add(size)
-	// }
-
-	// Decouple connection's flow control from application's read.
-	// An update on connection's flow control should not depend on
-	// whether user application has read the data or not. Such a
-	// restriction is already imposed on the stream's flow control,
-	// and therefore the sender will be blocked anyways.
-	// Decoupling the connection flow control will prevent other
-	// active(fast) streams from starving in presence of slow or
-	// inactive streams.
-	// if w := t.fc.onData(size); w > 0 {
-	// 	// fmt.Printf("http2_server.go: handleData: send connection-level window update of %d\n", w)
-	// 	t.controlBuf.put(&outgoingWindowUpdate{
-	// 		streamID:  0,
-	// 		increment: w,
-	// 	})
-	// }
-
-	// if sendBDPPing {
-	// 	// Avoid excessive ping detection (e.g. in an L7 proxy)
-	// 	// by sending a window update prior to the BDP ping.
-	// 	if w := t.fc.reset(); w > 0 {
-	// 		t.controlBuf.put(&outgoingWindowUpdate{
-	// 			streamID:  0,
-	// 			increment: w,
-	// 		})
-	// 	}
-	// 	t.controlBuf.put(bdpPing)
-	// }
-
-	// Select the right stream to dispatch.
-	if s.getState() == streamReadDone {
-		// t.closeStream(s, true, http2.ErrCodeStreamClosed, false)
-		return
-	}
 	if size > 0 {
-		// if err := s.fc.onData(size); err != nil {
-		// 	t.closeStream(s, true, http2.ErrCodeFlowControl, false)
-		// 	return
-		// }
-		// if f.Header().Flags.Has(http2.FlagDataPadded) {
-		// 	if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
-		// 		t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
-		// 	}
-		// }
-		// TODO(bradfitz, zhaoq): A copy is required here because there is no
-		// guarantee f.Data() is consumed before the arrival of next frame.
-		// Can this copy be eliminated?
 		if len(f.Data()) > 0 {
-			s.write(recvMsg{buffer: &mem.KomaBuffer{Data: f.Data()}})
+			s.komaBody = append(s.komaBody, f.Data()...)
 		}
 	}
 	if f.StreamEnded() {
 		// Received the end of stream from the client.
-		s.compareAndSwapState(streamActive, streamReadDone)
-		s.write(recvMsg{err: io.EOF})
+		s.komaEOF = true
 	}
 }
 
@@ -1697,10 +1571,10 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 		reader:      reader,
 		onEachWrite: t.setResetPingStrikes,
 	}
-	if err := s.wq.get(int32(len(hdr) + df.reader.Remaining())); err != nil {
-		_ = reader.Close()
-		return t.streamContextErr(s)
-	}
+	// if err := s.wq.get(int32(len(hdr) + df.reader.Remaining())); err != nil {
+	// 	_ = reader.Close()
+	// 	return t.streamContextErr(s)
+	// }
 	// if err := t.controlBuf.put(df); err != nil {
 	// 	_ = reader.Close()
 	// 	return err

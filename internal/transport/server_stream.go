@@ -50,6 +50,10 @@ type ServerStream struct {
 	hdrMu      sync.Mutex
 	header     metadata.MD // the outgoing header metadata.  Updated by WriteHeader.
 	headerSent atomic.Bool // atomically set when the headers are sent out.
+
+	// koma related
+	komaBody []byte
+	komaEOF  bool
 }
 
 // Read reads an n byte message from the input stream.

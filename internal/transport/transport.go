@@ -45,6 +45,70 @@ import (
 
 const logLevel = 2
 
+// payloadReader is implemented by the underlying reader used by transportReader
+// to fetch bytes for a stream (message header + message payload).
+type payloadReader interface {
+	// ReadMessageHeader reads into the provided header slice (typically 5 bytes).
+	ReadMessageHeader(header []byte) (int, error)
+	// Read reads up to n bytes and returns them in a mem.Buffer.
+	Read(n int) (mem.Buffer, error)
+}
+
+// komaUnaryReader implements payloadReader for the Koma unary fast path.
+// It reads from s.komaBody, which contains the complete DATA payload of the
+// stream (gRPC message header + message body).
+type komaUnaryReader struct {
+	s          *ServerStream
+	off        int  // current offset into s.komaBody
+	headerDone bool // whether we've already returned the 5-byte gRPC header
+}
+
+func (r *komaUnaryReader) ReadMessageHeader(header []byte) (int, error) {
+	if r.headerDone {
+		// No second message expected in unary fast path.
+		return 0, io.EOF
+	}
+	if len(header) == 0 {
+		return 0, nil
+	}
+	if len(r.s.komaBody)-r.off < len(header) {
+		// In Koma run-to-completion, by the time the handler starts reading,
+		// all DATA should already be present. If it's not, treat as bad.
+		if len(r.s.komaBody)-r.off == 0 {
+			return 0, io.EOF
+		}
+		return 0, io.ErrUnexpectedEOF
+	}
+
+	copy(header, r.s.komaBody[r.off:r.off+len(header)])
+	r.off += len(header)
+	r.headerDone = true
+	return len(header), nil
+}
+
+func (r *komaUnaryReader) Read(n int) (mem.Buffer, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	remain := len(r.s.komaBody) - r.off
+	if remain == 0 {
+		// No more data. For unary, this is EOF; the higher layers are
+		// responsible for not over-reading.
+		return nil, io.EOF
+	}
+
+	if n > remain {
+		n = remain
+	}
+
+	// mem.KomaBuffer is your Koma-specific mem.Buffer implementation.
+	// This allocates a thin wrapper over the sub-slice; no copying needed
+	// if KomaBuffer just stores the slice.
+	b := &mem.KomaBuffer{Data: r.s.komaBody[r.off : r.off+n]}
+	r.off += n
+	return b, nil
+}
+
 // recvMsg represents the received msg from the transport. All transport
 // protocol specific info has been removed.
 type recvMsg struct {
@@ -406,7 +470,8 @@ func (s *Stream) read(n int) (data mem.BufferSlice, err error) {
 // The error is io.EOF when the stream is done or another non-nil error if
 // the stream broke.
 type transportReader struct {
-	reader *recvBufferReader
+	// reader *recvBufferReader
+	reader payloadReader
 	// The handler to control the window update procedure for both this
 	// particular stream and the associated transport.
 	windowHandler func(int)
