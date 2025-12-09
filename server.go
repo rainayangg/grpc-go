@@ -651,13 +651,13 @@ func PinThreadToCPU(cpuID int) error {
 // re-allocations (see the runtime.morestack problem [1]).
 //
 // [1] https://github.com/golang/go/issues/18138
-func (s *Server) serverWorker(workerID int, cpuID int) {
+func (s *Server) serverWorker() {
 	// runtime.LockOSThread()
 	// defer runtime.UnlockOSThread()
 	// if err := PinThreadToCPU(cpuID); err != nil {
 	// 	panic(err)
 	// }
-	fmt.Printf("worker %d on linux cpu %d\n", workerID, cpuID)
+	// fmt.Printf("worker %d on linux cpu %d\n", workerID, cpuID)
 
 	komafd := koma.KomaInit()
 	fmt.Printf("Initialize KOMA socket %d\n", komafd)
@@ -702,13 +702,13 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 // initServerWorkers creates worker goroutines and a channel to process incoming
 // connections to reduce the time spent overall on runtime.morestack.
 func (s *Server) initServerWorkers() {
-	coreList := []int{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
+	// coreList := []int{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
 	s.serverWorkerChannel = make(chan func())
 	s.serverWorkerChannelClose = sync.OnceFunc(func() {
 		close(s.serverWorkerChannel)
 	})
 	for i := 0; i < int(s.opts.numServerWorkers); i++ {
-		go s.serverWorker(i, coreList[i%len(coreList)])
+		go s.serverWorker()
 	}
 }
 
