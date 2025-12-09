@@ -55,6 +55,7 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
+
 	// "google.golang.org/grpc/timetrace"
 	"golang.org/x/sys/unix"
 )
@@ -651,11 +652,11 @@ func PinThreadToCPU(cpuID int) error {
 //
 // [1] https://github.com/golang/go/issues/18138
 func (s *Server) serverWorker(workerID int, cpuID int) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if err := PinThreadToCPU(cpuID); err != nil {
-		panic(err)
-	}
+	// runtime.LockOSThread()
+	// defer runtime.UnlockOSThread()
+	// if err := PinThreadToCPU(cpuID); err != nil {
+	// 	panic(err)
+	// }
 	fmt.Printf("worker %d on linux cpu %d\n", workerID, cpuID)
 
 	komafd := koma.KomaInit()
