@@ -337,19 +337,6 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		if !bytes.Equal(preface, clientPreface) {
 			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
 		}
-		// fmt.Printf("Koma socket receives preface from the client!\n")
-
-		// Rui: only use here temporarily to read one single frame
-		//kconn, kok := conn.(*http2.KomaConn)
-		//if !kok {
-		//fmt.Printf("Not Koma socket!\n")
-		//return
-		//}
-
-		// koma.KomaPull(kconn.GetFd())
-
-		// need to call koma_pull first
-		// frame, err := t.framer.fr.ReadFrame()
 		_, err := t.framer.fr.ReadFrame()
 		// fmt.Printf("Koma socket receives first frame after preface!\n")
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -361,60 +348,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 			return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to read initial settings frame: %v", err)
 		}
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
-		// sf, ok := frame.(*http2.SettingsFrame)
-		// if !ok {
-		// 	fmt.Printf("Koma socket fails to read initial settings frame 3\n")
-		// 	return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
-		// }
-		// fmt.Printf("Koma socket receives the initial settings frame!\n")
-
-		// print map
-		// fmt.Printf("print map!\n")
-		//kconn.GetMap().Range(func(key, value any) bool {
-		//fmt.Printf("key=%v, value=%v\n", key, value)
-		//fmt.Println(kconn.RemoteAddr().String() == key)
-		//return true // keep iterating
-		//})
-		//remoteAddr := kconn.RemoteAddr().String()
-		//val, ok := kconn.GetMap().Load(remoteAddr)
-		//if !ok {
-		//fmt.Printf("connection %s not found in the map!\n", remoteAddr)
-		//return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams cannot find the associated TCP connection tor respond")
-		//}
-		//tcpSt := val.(*http2Server)
-		// fmt.Printf("Koma socket to send the settings ack\n")
-		// t.handleSettings(sf)
-
 	}
-
-	// Rui: LoopyWriter is only needed for rawTCP (send messages back to the students in the TX path),
-	// but unnecessary for the koma connection, as we decided not to use Koma TX path.
-	// if !ifkoma {
-	// 	go func() {
-	// 		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger, t.outgoingGoAwayHandler, t.bufferPool)
-	// 		err := t.loopy.run()
-	// 		close(t.loopyWriterDone)
-	// 		if !isIOError(err) {
-	// 			// Close the connection if a non-I/O error occurs (for I/O errors
-	// 			// the reader will also encounter the error and close).  Wait 1
-	// 			// second before closing the connection, or when the reader is done
-	// 			// (i.e. the client already closed the connection or a connection
-	// 			// error occurred).  This avoids the potential problem where there
-	// 			// is unread data on the receive side of the connection, which, if
-	// 			// closed, would lead to a TCP RST instead of FIN, and the client
-	// 			// encountering errors.  For more info:
-	// 			// https://github.com/grpc/grpc-go/issues/5358
-	// 			timer := time.NewTimer(time.Second)
-	// 			defer timer.Stop()
-	// 			select {
-	// 			case <-t.readerDone:
-	// 			case <-timer.C:
-	// 			}
-	// 			t.conn.Close()
-	// 		}
-	// 	}()
-	// 	go t.keepalive()
-	// }
 	return t, nil
 }
 
