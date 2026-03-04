@@ -42,6 +42,7 @@ import (
 	istatus "google.golang.org/grpc/internal/status"
 	"google.golang.org/grpc/internal/syscall"
 	"google.golang.org/grpc/mem"
+
 	// "google.golang.org/grpc/timetrace"
 	"google.golang.org/protobuf/proto"
 
@@ -922,8 +923,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 
 		frames, err := t.framer.komafr.ReadFrames()
 		// timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
-		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
-		// fmt.Printf("%+v\n", frames)
+		fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
+		fmt.Printf("%+v\n", frames)
 
 		if frames == nil || len(frames) == 0 {
 			// fmt.Printf("HandleStreamsKoma: no frames read, continue\n")

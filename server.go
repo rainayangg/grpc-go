@@ -701,7 +701,7 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 // initServerWorkers creates worker goroutines and a channel to process incoming
 // connections to reduce the time spent overall on runtime.morestack.
 func (s *Server) initServerWorkers() {
-	coreList := []int{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
+	coreList := []int{0,1,2,3,4,5,6,7,8}
 	s.serverWorkerChannel = make(chan func())
 	s.serverWorkerChannelClose = sync.OnceFunc(func() {
 		close(s.serverWorkerChannel)
