@@ -26,8 +26,10 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -154,9 +156,9 @@ type Server struct {
 
 	serverWorkerChannel      chan func()
 	serverWorkerChannelClose func()
-	// TODO(Rui): grpc-koma does not need ebpf program anyway, to be removed after the bpf part is removed in the koma code
-	komafds []int // all koma sockets belonging to this server
-
+	komafds     []int // all koma sockets belonging to this server
+	komaEnabled bool  // whether koma is enabled (set via GRPC_KOMA_CORES env var)
+	komaCores   []int // CPU cores for koma workers
 }
 
 type serverOptions struct {
@@ -701,13 +703,12 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 // initServerWorkers creates worker goroutines and a channel to process incoming
 // connections to reduce the time spent overall on runtime.morestack.
 func (s *Server) initServerWorkers() {
-	coreList := []int{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
 	s.serverWorkerChannel = make(chan func())
 	s.serverWorkerChannelClose = sync.OnceFunc(func() {
 		close(s.serverWorkerChannel)
 	})
 	for i := 0; i < int(s.opts.numServerWorkers); i++ {
-		go s.serverWorker(i, coreList[i%len(coreList)])
+		go s.serverWorker(i, s.komaCores[i%len(s.komaCores)])
 	}
 }
 
@@ -738,8 +739,25 @@ func NewServer(opt ...ServerOption) *Server {
 		s.events = newTraceEventLog("grpc.Server", fmt.Sprintf("%s:%d", file, line))
 	}
 
+	// Parse GRPC_KOMA_CORES env var to enable koma and configure worker CPU pinning.
+	if cores := os.Getenv("GRPC_KOMA_CORES"); cores != "" {
+		s.komaEnabled = true
+		for _, c := range strings.Split(cores, ",") {
+			core, err := strconv.Atoi(strings.TrimSpace(c))
+			if err != nil {
+				logger.Fatalf("grpc: invalid GRPC_KOMA_CORES value %q: %v", cores, err)
+			}
+			s.komaCores = append(s.komaCores, core)
+		}
+		if s.opts.numServerWorkers == 0 {
+			s.opts.numServerWorkers = uint32(len(s.komaCores))
+		}
+	}
+
 	if s.opts.numServerWorkers > 0 {
-		fmt.Printf("start %d server workers\n", s.opts.numServerWorkers)
+		if !s.komaEnabled {
+			logger.Fatalf("grpc: numServerWorkers > 0 but GRPC_KOMA_CORES is not set")
+		}
 		s.initServerWorkers()
 	}
 
