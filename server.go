@@ -30,6 +30,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"sync/atomic"
 	"time"
 
@@ -701,7 +702,7 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 // initServerWorkers creates worker goroutines and a channel to process incoming
 // connections to reduce the time spent overall on runtime.morestack.
 func (s *Server) initServerWorkers() {
-	coreList := []int{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
+	coreList := []int{0, 1, 2, 3, 4, 5, 6, 7}
 	s.serverWorkerChannel = make(chan func())
 	s.serverWorkerChannelClose = sync.OnceFunc(func() {
 		close(s.serverWorkerChannel)
@@ -886,9 +887,46 @@ func makeConnKey(ip net.IP, port int) ConnKey {
 	return ConnKey(fmt.Sprintf("%s:%d", ip.String(), port))
 }
 
+func unwrapConn(conn net.Conn) net.Conn {
+	for conn != nil {
+		if _, ok := conn.(interface {
+			SyscallConn() (syscall.RawConn, error)
+		}); ok {
+			return conn
+		}
+
+		v := reflect.ValueOf(conn)
+		if v.Kind() == reflect.Pointer {
+			v = v.Elem()
+		}
+		if !v.IsValid() || v.Kind() != reflect.Struct {
+			return conn
+		}
+
+		field := v.FieldByName("Conn")
+		if !field.IsValid() || !field.CanInterface() {
+			return conn
+		}
+
+		next, ok := field.Interface().(net.Conn)
+		if !ok || next == conn {
+			return conn
+		}
+		conn = next
+	}
+	return nil
+}
+
 func GetFdFromTCPConn(conn net.Conn) (int, error) {
-	tcpConn := conn.(*net.TCPConn)
-	rawConn, err := tcpConn.SyscallConn()
+	conn = unwrapConn(conn)
+	rawConnConn, ok := conn.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	})
+	if !ok {
+		return -1, fmt.Errorf("connection does not expose SyscallConn: %T", conn)
+	}
+
+	rawConn, err := rawConnConn.SyscallConn()
 	if err != nil {
 		return -1, err
 	}
@@ -1029,20 +1067,25 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	// Rui: serverTransport for the raw TCP connection is needed because
 	// we use it for the TX path.
 
-	fd, _ := GetFdFromTCPConn(rawConn)
-	fmt.Printf("create a new HTTP transport for TCP connection %d\n", fd)
+	fd, ferr := GetFdFromTCPConn(rawConn)
+	if ferr == nil {
+		fmt.Printf("create a new HTTP transport for TCP connection %d\n", fd)
+	} else {
+		fmt.Printf("create a new HTTP transport for wrapped connection %T\n", rawConn)
+	}
 	st := s.newHTTP2Transport(rawConn, false)
 
-	fd, ferr := GetFdFromTCPConn(rawConn)
 	if ferr != nil {
-		fmt.Printf("failed to get new TCP connection fd")
+		fmt.Printf("failed to get new TCP connection fd: %v\n", ferr)
+	} else if len(s.komafds) == 0 {
+		fmt.Printf("skip KOMA attach: no server KOMA socket initialized\n")
+	} else {
+		ierr := koma.KomaAttach(s.komafds[0], fd)
+		if ierr == -1 {
+			fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
+		}
+		fmt.Printf("Accept new TCP connection, attach to KOMA\n")
 	}
-
-	ierr := koma.KomaAttach(s.komafds[0], fd)
-	if ierr == -1 {
-		fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
-	}
-	fmt.Printf("Accept new TCP connection, attach to KOMA\n")
 
 	rawConn.SetDeadline(time.Time{})
 	if st == nil {

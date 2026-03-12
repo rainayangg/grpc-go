@@ -19,7 +19,3 @@ func KomaInit() int {
 func KomaAttach(fd int, csock int) int {
 	return int(C.koma_attach(C.int(fd), C.int(csock)))
 }
-
-func BpfInit(str string) int {
-	return int(C.bpf_init(C.CString(str)))
-}
