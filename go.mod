@@ -43,4 +43,4 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20250324211829-b45e905df463 // indirect
 )
 
-replace golang.org/x/net => /root/net-go
+replace golang.org/x/net => /home/ubuntu/net-go

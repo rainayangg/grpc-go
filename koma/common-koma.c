@@ -5,49 +5,11 @@
 #include <string.h>
 #include <sys/ioctl.h>
 
-#include <bcc/bcc_common.h>
-#include <bcc/libbpf.h>
-#include <bpf/bpf.h>
 #include <fcntl.h>
 
 #include "common-koma.h"
 
 #define _GNU_SOURCE
-
-int bpf_init(const char *service_proto) {
-  int fd = 0;
-  char bpf_prog[50];
-  void *mod;
-
-  if (strcmp(service_proto, "memcache-bin") == 0) {
-    strcpy(bpf_prog, "memcache-bin_kern.c");
-  } else if (strcmp(service_proto, "memcache-id") == 0) {
-    // assume the bpf program is in the parent folder of grpc-go
-    strcpy(bpf_prog, "../../memcache-id_kern.c");
-  } else {
-    printf("Unknown protocol: %s\n", service_proto);
-    exit(1);
-  }
-
-  mod = bpf_module_create_c(bpf_prog, 0, NULL, 0, 0, NULL);
-  if (!mod) {
-    perror("Failed to create BPF module");
-    exit(1);
-  }
-
-  fd = bcc_prog_load(BPF_PROG_TYPE_SK_SKB, "memcached_koma",
-                     bpf_function_start(mod, "memcached_koma"),
-                     bpf_function_size(mod, "memcached_koma"),
-                     bpf_module_license(mod), bpf_module_kern_version(mod), 0,
-                     NULL, 0);
-
-  if (fd == -1) {
-    perror("Failed to load BPF program");
-    exit(1);
-  }
-
-  return fd;
-}
 
 static void setnonblocking(int fd) {
   int flags;
