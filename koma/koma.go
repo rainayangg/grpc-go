@@ -2,7 +2,7 @@ package koma
 
 /*
 #cgo CFLAGS: -I${SRCDIR}
-#cgo LDFLAGS: -lbcc -lm
+#cgo LDFLAGS: -lm
 #include "common-koma.h"
 */
 import "C"
