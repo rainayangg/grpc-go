@@ -1104,7 +1104,7 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	} else if len(s.komafds) == 0 {
 		fmt.Printf("skip KOMA attach: no server KOMA socket initialized\n")
 	} else {
-		ierr := koma.KomaAttach(s.komafds[0], fd)
+		ierr := koma.KomaAttach(s.komafds[0], fd, int(s.effectiveInitialConnWindowSize()))
 		if ierr == -1 {
 			fmt.Printf("IOCTL ERROR: ioctl(SIOKOMAATTACH)")
 		}

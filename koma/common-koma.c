@@ -26,13 +26,14 @@ int koma_init(void) {
   return komafd;
 }
 
-int koma_attach(int komafd, int csock) {
+int koma_attach(int komafd, int csock, int initial_conn_window) {
   int error;
-  struct kcm_attach attach_info;
+  struct koma_attach attach_info;
 
   memset(&attach_info, 0, sizeof(attach_info));
   attach_info.fd = csock;
   attach_info.bpf_fd = -1;
+  attach_info.initial_conn_window = initial_conn_window;
 
   error = ioctl(komafd, SIOCKOMAATTACH, &attach_info);
 

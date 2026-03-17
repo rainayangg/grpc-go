@@ -16,6 +16,6 @@ func KomaInit() int {
 	return int(C.koma_init())
 }
 
-func KomaAttach(fd int, csock int) int {
-	return int(C.koma_attach(C.int(fd), C.int(csock)))
+func KomaAttach(fd int, csock int, initialConnWindow int) int {
+	return int(C.koma_attach(C.int(fd), C.int(csock), C.int(initialConnWindow)))
 }
