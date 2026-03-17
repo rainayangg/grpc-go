@@ -202,6 +202,12 @@ var defaultServerOptions = serverOptions{
 	readBufferSize:        defaultReadBufSize,
 	bufferPool:            mem.DefaultBufferPool(),
 }
+
+const (
+	minHTTP2FlowControlWindow        int32 = 65535
+	komaDefaultInitialConnWindowSize int32 = 126553500
+)
+
 var globalServerOptions []ServerOption
 
 // A ServerOption sets options such as credentials, codec and keepalive parameters, etc.
@@ -1140,7 +1146,7 @@ func (s *Server) newHTTP2Transport(c net.Conn, ifkoma bool) transport.ServerTran
 		KeepaliveParams:       s.opts.keepaliveParams,
 		KeepalivePolicy:       s.opts.keepalivePolicy,
 		InitialWindowSize:     s.opts.initialWindowSize,
-		InitialConnWindowSize: s.opts.initialConnWindowSize,
+		InitialConnWindowSize: s.effectiveInitialConnWindowSize(),
 		WriteBufferSize:       s.opts.writeBufferSize,
 		ReadBufferSize:        s.opts.readBufferSize,
 		SharedWriteBuffer:     s.opts.sharedWriteBuffer,
@@ -1172,6 +1178,13 @@ func (s *Server) newHTTP2Transport(c net.Conn, ifkoma bool) transport.ServerTran
 	//fmt.Printf("here %+v %v\n", st, err)
 	//}
 	return st
+}
+
+func (s *Server) effectiveInitialConnWindowSize() int32 {
+	if s.komaEnabled && s.opts.initialConnWindowSize < minHTTP2FlowControlWindow {
+		return komaDefaultInitialConnWindowSize
+	}
+	return s.opts.initialConnWindowSize
 }
 
 func (s *Server) serveStreams(ctx context.Context, st transport.ServerTransport, rawConn net.Conn) {
