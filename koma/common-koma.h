@@ -23,6 +23,8 @@
 #define SIOCKOMAPULL (SIOCPROTOPRIVATE + 3)
 #endif
 
+#define KOMA_ATTACH_EXTENDED_BPF_FD (-2)
+
 struct koma_attach {
 	int fd;
 	int bpf_fd;
