@@ -337,7 +337,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		if !bytes.Equal(preface, clientPreface) {
 			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
 		}
-		_, err := t.framer.fr.ReadFrame()
+		initialFrame, err := t.framer.fr.ReadFrame()
 		// fmt.Printf("Koma socket receives first frame after preface!\n")
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			fmt.Printf("Koma socket fails to read initial settings frame 1\n")
@@ -346,6 +346,19 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		if err != nil {
 			fmt.Printf("Koma socket fails to read initial settings frame 2\n")
 			return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to read initial settings frame: %v", err)
+		}
+		sf, ok := initialFrame.(*http2.SettingsFrame)
+		if !ok {
+			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received %T as the first frame from client", initialFrame)
+		}
+		if sf.IsAck() {
+			return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received SETTINGS ACK as the first frame from client")
+		}
+		if err := t.framer.fr.WriteSettingsAck(); err != nil {
+			return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to ack initial settings frame: %v", err)
+		}
+		if err := t.framer.writer.Flush(); err != nil {
+			return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to flush initial settings ack: %v", err)
 		}
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 	}
