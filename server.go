@@ -1121,17 +1121,6 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	}); ok {
 		cc.PassServerTransport(st)
 	}
-
-	if !s.addConn(lisAddr, st) {
-		return
-	}
-
-	// Rui: the following original go routine func() is commented, because
-	// we no longer read from the TCP streams in the RX path anymore
-	//go func() {
-	//s.serveStreams(context.Background(), st, rawConn)
-	//s.removeConn(lisAddr, st)
-	//}()
 }
 
 // newHTTP2Transport sets up a http/2 transport (using the
