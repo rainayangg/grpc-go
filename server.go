@@ -1121,6 +1121,12 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	}); ok {
 		cc.PassServerTransport(st)
 	}
+
+	// In Koma mode, the raw TCP transport still owns the frontend-facing
+	// connection lifetime even though request reads happen elsewhere.
+	if !s.addConn(lisAddr, st) {
+		return
+	}
 }
 
 // newHTTP2Transport sets up a http/2 transport (using the
