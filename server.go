@@ -101,6 +101,80 @@ var (
 	logger   = grpclog.Component("core")
 )
 
+const (
+	grpcKomaCoresEnvName          = "GRPC_KOMA_CORES"
+	grpcKomaWorkersPerCoreEnvName = "GRPC_KOMA_WORKERS_PER_CORE"
+	grpcKomaWorkerModeEnvName     = "GRPC_KOMA_WORKER_MODE"
+)
+
+type komaWorkerMode string
+
+const (
+	komaWorkerModePinned  komaWorkerMode = "pinned"
+	komaWorkerModeRuntime komaWorkerMode = "runtime"
+)
+
+type komaConfig struct {
+	enabled        bool
+	cores          []int
+	numWorkers     uint32
+	workersPerCore int
+	workerMode     komaWorkerMode
+}
+
+func parseKomaConfig(coresEnv, workersPerCoreEnv, workerModeEnv string, configuredWorkers uint32) (komaConfig, error) {
+	cfg := komaConfig{workerMode: komaWorkerModePinned}
+	if workerModeEnv != "" {
+		cfg.workerMode = komaWorkerMode(workerModeEnv)
+		switch cfg.workerMode {
+		case komaWorkerModePinned, komaWorkerModeRuntime:
+		default:
+			return komaConfig{}, fmt.Errorf("invalid %s value %q: must be %q or %q", grpcKomaWorkerModeEnvName, workerModeEnv, komaWorkerModePinned, komaWorkerModeRuntime)
+		}
+	}
+
+	if coresEnv == "" {
+		switch {
+		case workersPerCoreEnv != "":
+			return komaConfig{}, fmt.Errorf("%s is set but %s is not", grpcKomaWorkersPerCoreEnvName, grpcKomaCoresEnvName)
+		case workerModeEnv != "":
+			return komaConfig{}, fmt.Errorf("%s is set but %s is not", grpcKomaWorkerModeEnvName, grpcKomaCoresEnvName)
+		default:
+			return cfg, nil
+		}
+	}
+
+	cfg.enabled = true
+	for _, c := range strings.Split(coresEnv, ",") {
+		core, err := strconv.Atoi(strings.TrimSpace(c))
+		if err != nil {
+			return komaConfig{}, fmt.Errorf("invalid %s value %q: %w", grpcKomaCoresEnvName, coresEnv, err)
+		}
+		cfg.cores = append(cfg.cores, core)
+	}
+
+	if workersPerCoreEnv != "" {
+		if configuredWorkers != 0 {
+			return komaConfig{}, fmt.Errorf("%s and NumStreamWorkers cannot both be set", grpcKomaWorkersPerCoreEnvName)
+		}
+		workersPerCore, err := strconv.Atoi(strings.TrimSpace(workersPerCoreEnv))
+		if err != nil || workersPerCore <= 0 {
+			return komaConfig{}, fmt.Errorf("invalid %s value %q: must be a positive integer", grpcKomaWorkersPerCoreEnvName, workersPerCoreEnv)
+		}
+		cfg.workersPerCore = workersPerCore
+		cfg.numWorkers = uint32(len(cfg.cores) * workersPerCore)
+		return cfg, nil
+	}
+
+	if configuredWorkers == 0 {
+		cfg.numWorkers = uint32(len(cfg.cores))
+		return cfg, nil
+	}
+
+	cfg.numWorkers = configuredWorkers
+	return cfg, nil
+}
+
 // MethodHandler is a function type that processes a unary RPC method call.
 type MethodHandler func(srv any, ctx context.Context, dec func(any) error, interceptor UnaryServerInterceptor) (any, error)
 
@@ -160,6 +234,7 @@ type Server struct {
 	komafds                  []int // all koma sockets belonging to this server
 	komaEnabled              bool  // whether koma is enabled (set via GRPC_KOMA_CORES env var)
 	komaCores                []int // CPU cores for koma workers
+	komaWorkerMode           komaWorkerMode
 }
 
 type serverOptions struct {
@@ -660,10 +735,12 @@ func PinThreadToCPU(cpuID int) error {
 //
 // [1] https://github.com/golang/go/issues/18138
 func (s *Server) serverWorker(workerID int, cpuID int) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if err := PinThreadToCPU(cpuID); err != nil {
-		panic(err)
+	if s.komaWorkerMode == komaWorkerModePinned {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := PinThreadToCPU(cpuID); err != nil {
+			panic(err)
+		}
 	}
 	fmt.Printf("worker %d on linux cpu %d\n", workerID, cpuID)
 
@@ -746,24 +823,27 @@ func NewServer(opt ...ServerOption) *Server {
 		s.events = newTraceEventLog("grpc.Server", fmt.Sprintf("%s:%d", file, line))
 	}
 
-	// Parse GRPC_KOMA_CORES env var to enable koma and configure worker CPU pinning.
-	if cores := os.Getenv("GRPC_KOMA_CORES"); cores != "" {
+	komaCfg, err := parseKomaConfig(
+		os.Getenv(grpcKomaCoresEnvName),
+		os.Getenv(grpcKomaWorkersPerCoreEnvName),
+		os.Getenv(grpcKomaWorkerModeEnvName),
+		s.opts.numServerWorkers,
+	)
+	if err != nil {
+		logger.Fatalf("grpc: %v", err)
+	}
+	if komaCfg.enabled {
 		s.komaEnabled = true
-		for _, c := range strings.Split(cores, ",") {
-			core, err := strconv.Atoi(strings.TrimSpace(c))
-			if err != nil {
-				logger.Fatalf("grpc: invalid GRPC_KOMA_CORES value %q: %v", cores, err)
-			}
-			s.komaCores = append(s.komaCores, core)
-		}
-		if s.opts.numServerWorkers == 0 {
-			s.opts.numServerWorkers = uint32(len(s.komaCores))
+		s.komaCores = append(s.komaCores, komaCfg.cores...)
+		s.komaWorkerMode = komaCfg.workerMode
+		if s.opts.numServerWorkers == 0 || os.Getenv(grpcKomaWorkersPerCoreEnvName) != "" {
+			s.opts.numServerWorkers = komaCfg.numWorkers
 		}
 	}
 
 	if s.opts.numServerWorkers > 0 {
 		if !s.komaEnabled {
-			logger.Fatalf("grpc: numServerWorkers > 0 but GRPC_KOMA_CORES is not set")
+			logger.Fatalf("grpc: numServerWorkers > 0 but %s is not set", grpcKomaCoresEnvName)
 		}
 		s.initServerWorkers()
 	}
