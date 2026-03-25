@@ -660,8 +660,6 @@ func PinThreadToCPU(cpuID int) error {
 //
 // [1] https://github.com/golang/go/issues/18138
 func (s *Server) serverWorker(workerID int, cpuID int) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	fmt.Printf("worker %d (unpinned, cpuID hint %d)\n", workerID, cpuID)
 
 	komafd := koma.KomaInit()
