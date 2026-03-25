@@ -662,10 +662,7 @@ func PinThreadToCPU(cpuID int) error {
 func (s *Server) serverWorker(workerID int, cpuID int) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if err := PinThreadToCPU(cpuID); err != nil {
-		panic(err)
-	}
-	fmt.Printf("worker %d on linux cpu %d\n", workerID, cpuID)
+	fmt.Printf("worker %d (unpinned, cpuID hint %d)\n", workerID, cpuID)
 
 	komafd := koma.KomaInit()
 	fmt.Printf("Initialize KOMA socket %d\n", komafd)
