@@ -42,6 +42,7 @@ import (
 	istatus "google.golang.org/grpc/internal/status"
 	"google.golang.org/grpc/internal/syscall"
 	"google.golang.org/grpc/mem"
+
 	// "google.golang.org/grpc/timetrace"
 	"google.golang.org/protobuf/proto"
 
@@ -404,7 +405,9 @@ func (t *http2Server) processCleanupStream(streamID uint32, rstCode http2.ErrCod
 // error encountered and transport needs to close, otherwise returns nil.
 func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame) (*ServerStream, error) {
 	streamID := frame.Header().StreamID
+	t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma start stream_id=%d truncated=%v fields=%d end_stream=%v header_len=%d", streamID, frame.Truncated, len(frame.Fields), frame.StreamEnded(), frame.Header().Length)
 	if frame.Truncated {
+		t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma truncated stream_id=%d", streamID)
 		t.processCleanupStream(streamID, http2.ErrCodeFrameSize)
 		return nil, nil
 	}
@@ -469,12 +472,15 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			// KOMA: ignore other headers for koma socket for now.
 		}
 	}
+	t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma parsed stream_id=%d method=%q path=%q is_grpc=%v content_subtype=%q recv_compress=%q advertised_compressors=%q protocol_error=%v header_error=%v timeout_set=%v", streamID, httpMethod, s.method, isGRPC, s.contentSubtype, s.recvCompress, s.clientAdvertisedCompressors, protocolError, headerError != nil, timeoutSet)
 
 	if protocolError {
+		t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma protocol_error stream_id=%d", streamID)
 		t.processCleanupStream(streamID, http2.ErrCodeProtocol)
 		return s, nil
 	}
 	if !isGRPC {
+		t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma early_abort_invalid_content_type stream_id=%d content_type=%q end_stream=%v", streamID, contentType, frame.StreamEnded())
 		eas := &earlyAbortStream{
 			httpStatus:     http.StatusUnsupportedMediaType,
 			streamID:       streamID,
@@ -486,6 +492,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		return s, nil
 	}
 	if headerError != nil {
+		t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma early_abort_header_error stream_id=%d error=%q end_stream=%v", streamID, headerError.Message(), frame.StreamEnded())
 		eas := &earlyAbortStream{
 			httpStatus:     http.StatusBadRequest,
 			streamID:       streamID,
@@ -512,6 +519,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 
 	if httpMethod != http.MethodPost {
 		errMsg := fmt.Sprintf("Received a HEADERS frame with :method %q which should be POST", httpMethod)
+		t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma early_abort_invalid_method stream_id=%d method=%q path=%q", streamID, httpMethod, s.method)
 		if t.logger.V(logLevel) {
 			t.logger.Infof("Aborting the stream early: %v", errMsg)
 		}
@@ -534,6 +542,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		},
 		windowHandler: func(n int) {},
 	}
+	t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma ready stream_id=%d method=%q path=%q state=%v", streamID, httpMethod, s.method, s.getState())
 	return s, nil
 }
 
@@ -898,6 +907,7 @@ func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStre
 
 // HandleStreamsKoma receives incoming streams. The difference from the default one is that we do not give them to any handler directly. Instead, the handler function is called directly in serverWorker().
 func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle func(*ServerStream)) {
+	t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma start komafd=%d", komafd)
 	defer func() {
 		close(t.readerDone)
 		<-t.loopyWriterDone
@@ -934,11 +944,13 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		// }
 
 		frames, err := t.framer.komafr.ReadFrames()
+		t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma read_frames komafd=%d frames=%d err=%v", komafd, len(frames), err)
 		// timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
 		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
 		// fmt.Printf("%+v\n", frames)
 
 		if frames == nil || len(frames) == 0 {
+			t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma empty_read komafd=%d", komafd)
 			// fmt.Printf("HandleStreamsKoma: no frames read, continue\n")
 			continue
 		}
@@ -947,10 +959,12 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 
 		if err != nil {
 			if _, ok := err.(http2.StreamError); ok {
+				t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma stream_error stream_id=%d code=%v frames=%d", frames[0].Header().StreamID, err.(http2.StreamError).Code, len(frames))
 				fmt.Printf("Write RST stream for %d", frames[0].Header().StreamID)
 				t.framer.komafr.WriteRSTStream(frames[0].Header().StreamID, err.(http2.StreamError).Code)
 				continue
 			}
+			t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma fatal_read_error komafd=%d frames=%d err=%v", komafd, len(frames), err)
 			t.Close(err)
 			return
 		}
@@ -962,16 +976,29 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			switch frame := frame.(type) {
 			case *http2.MetaHeadersFrame:
 				ifNewStream = true
+				t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma meta_headers stream_id=%d fields=%d end_stream=%v truncated=%v", frame.Header().StreamID, len(frame.Fields), frame.StreamEnded(), frame.Truncated)
 				s, err := t.operateHeadersKoma(ctx, frame)
 				if err != nil {
+					t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma operate_headers_error stream_id=%d err=%v", frame.Header().StreamID, err)
 					continue
 				}
 				stream = s
+				if stream == nil {
+					t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma stream_created_nil stream_id=%d", frame.Header().StreamID)
+				} else {
+					t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma stream_created stream_id=%d method=%q state=%v", stream.id, stream.method, stream.getState())
+				}
 				// stream.Mark = t.framer.komafr.GetMark()
 			case *http2.DataFrame:
+				if stream == nil {
+					t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma data_frame_no_stream stream_id=%d data_len=%d end_stream=%v", frame.Header().StreamID, len(frame.Data()), frame.StreamEnded())
+				} else {
+					t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma data_frame stream_id=%d data_len=%d end_stream=%v current_state=%v", frame.Header().StreamID, len(frame.Data()), frame.StreamEnded(), stream.getState())
+				}
 				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
 				t.handleDataKoma(frame, stream)
 			default:
+				t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma unsupported_frame stream_id=%d frame_type=%T", frame.Header().StreamID, frame)
 				if t.logger.V(logLevel) {
 					t.logger.Infof("Received unsupported frame type %T", frame)
 				}
@@ -983,6 +1010,11 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
 		// the associated stream (which involves blocking and waiting), ii) assign a go-routine worker to do the associated work.
 		if ifNewStream {
+			if stream == nil {
+				t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma handle_nil_stream")
+			} else {
+				t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma dispatch_handle stream_id=%d method=%q state=%v", stream.id, stream.method, stream.getState())
+			}
 			// fmt.Printf("HandleStreamsKoma: start handling stream\n")
 			handle(stream)
 		}
@@ -1051,7 +1083,12 @@ func (t *http2Server) updateFlowControl(n uint32) {
 }
 
 func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
+	if s == nil {
+		t.logger.Infof("DELETEME: (http2Server) (rx) handleDataKoma nil_stream stream_id=%d data_len=%d end_stream=%v", f.Header().StreamID, len(f.Data()), f.StreamEnded())
+		return
+	}
 	size := f.Header().Length
+	t.logger.Infof("DELETEME: (http2Server) (rx) handleDataKoma start stream_id=%d size=%d data_len=%d end_stream=%v state=%v", s.id, size, len(f.Data()), f.StreamEnded(), s.getState())
 	if size > 0 {
 		if len(f.Data()) > 0 {
 			s.write(recvMsg{buffer: &mem.KomaBuffer{Data: f.Data()}})
@@ -1061,6 +1098,7 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 		s.state = streamReadDone
 		s.write(recvMsg{err: io.EOF})
 	}
+	t.logger.Infof("DELETEME: (http2Server) (rx) handleDataKoma done stream_id=%d end_stream=%v state=%v", s.id, f.StreamEnded(), s.getState())
 }
 
 func (t *http2Server) handleData(f *http2.DataFrame) {
@@ -1428,6 +1466,7 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 	if s.getState() == streamDone {
 		return nil
 	}
+	t.logger.Infof("DELETEME: (http2Server) (tx) writeStatus start stream_id=%d code=%s message=%q header_sent=%v state=%v", s.id, st.Code().String(), st.Message(), s.isHeaderSent(), s.getState())
 
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
@@ -1474,6 +1513,7 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 	err := t.processHeaderFrame(s.id, trailingHeader)
 	// fmt.Printf("http2_server.go: writeStatus: processHeaderFrame returned err %v\n", err)
 	if err != nil {
+		t.logger.Infof("DELETEME: (http2Server) (tx) writeStatus error stream_id=%d code=%s err=%v", s.id, st.Code().String(), err)
 		return err
 	}
 	// Send a RST_STREAM after the trailers if the client has not already half-closed.
@@ -1486,6 +1526,7 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 			Trailer: s.trailer.Copy(),
 		})
 	}
+	t.logger.Infof("DELETEME: (http2Server) (tx) writeStatus done stream_id=%d code=%s rst=%v", s.id, st.Code().String(), rst)
 	return nil
 }
 
@@ -1493,12 +1534,15 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 // is returns if it fails (e.g., framing error, transport error).
 func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
 	// fmt.Printf("Write:0\n")
+	t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write start stream_id=%d hdr_len=%d data_buffers=%d header_sent=%v state=%v", s.id, len(hdr), len(data), s.isHeaderSent(), s.getState())
 	reader := data.Reader()
 
 	// fmt.Printf("Write: 1\n")
 	if !s.isHeaderSent() { // Headers haven't been written yet.
 		// fmt.Printf("!s.isHeaderSent()\n")
+		t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_header_before_data stream_id=%d", s.id)
 		if err := t.writeHeader(s, nil); err != nil {
+			t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_header_error stream_id=%d err=%v", s.id, err)
 			_ = reader.Close()
 			return err
 		}
@@ -1506,6 +1550,7 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 		// fmt.Printf("s.isHeaderSent()\n")
 		// Writing headers checks for this condition.
 		if s.getState() == streamDone {
+			t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write stream_done stream_id=%d", s.id)
 			_ = reader.Close()
 			return t.streamContextErr(s)
 		}
@@ -1532,11 +1577,14 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 	// the following logic ic a simplified version (w/o flow control) of processData() in loopy_writer.go
 	// fmt.Printf("Write: 3\n")
 	if len(df.h) == 0 && df.reader.Remaining() == 0 {
+		t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write empty_data_frame stream_id=%d end_stream=%v", df.streamID, df.endStream)
 		// Empty data Frame
 		// Client sends out empty data frame with endStream = true
 		if err := t.framer.komafr.WriteData(df.streamID, df.endStream, nil); err != nil {
+			t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_data_error stream_id=%d empty=true err=%v", df.streamID, err)
 			return err
 		}
+		t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_data_ok stream_id=%d empty=true", df.streamID)
 		_ = df.reader.Close()
 		return nil
 	}
@@ -1548,6 +1596,7 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 	}
 	hSize := len(df.h)
 	dSize := df.reader.Remaining()
+	t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write payload_sizes stream_id=%d grpc_hdr_len=%d grpc_data_len=%d", df.streamID, hSize, dSize)
 	buf = pool.Get(hSize + dSize)
 	defer pool.Put(buf)
 
@@ -1559,9 +1608,12 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 		df.onEachWrite()
 	}
 	// fmt.Printf("http2_server.go: write: write data frame of size %d (header %d + data %d) on stream %d\n", hSize+dSize, hSize, dSize, df.streamID)
+	t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_data_start stream_id=%d frame_payload_len=%d end_stream=%v", df.streamID, hSize+dSize, df.endStream)
 	if err := t.framer.komafr.WriteData(df.streamID, df.endStream, (*buf)[:hSize+dSize]); err != nil {
+		t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_data_error stream_id=%d empty=false err=%v", df.streamID, err)
 		return err
 	}
+	t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_data_ok stream_id=%d empty=false", df.streamID)
 	df.reader.Close()
 
 	return nil

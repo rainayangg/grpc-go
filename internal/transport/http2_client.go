@@ -154,6 +154,15 @@ type http2Client struct {
 	logger       *grpclog.PrefixLogger
 }
 
+func deleteMeClientTransportTraceInfo(s *ClientStream) (method string, streamID uint32, enabled bool) {
+	if s == nil {
+		return "", 0, false
+	}
+	method = s.Method()
+	streamID = s.ID()
+	return method, streamID, true
+}
+
 func dial(ctx context.Context, fn func(context.Context, string) (net.Conn, error), addr resolver.Address, grpcUA string) (net.Conn, error) {
 	address := addr.Addr
 	networkType, ok := networktype.Get(addr)
@@ -366,6 +375,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 			Security:         czSecurity,
 		})
 	t.logger = prefixLoggerForClientTransport(t)
+	t.logger.Infof("DELETEME: (http2Client) (tx) transport_init remote=%v local=%v secure=%v scheme=%q user_agent=%q", t.remoteAddr, t.localAddr, t.isSecure, t.scheme, t.userAgent)
 	// Add peer information to the http2client context.
 	t.ctx = peer.NewContext(t.ctx, t.getPeer())
 
@@ -418,12 +428,13 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 	}()
 
 	// Send connection preface to server.
+	t.logger.Infof("DELETEME: (http2Client) (tx) send_client_preface start bytes=%d", len(clientPreface))
 	n, err := t.conn.Write(clientPreface)
 	if err != nil {
 		err = connectionErrorf(true, err, "transport: failed to write client preface: %v", err)
 		return nil, err
 	}
-	fmt.Printf("Client: send preface to the server\n")
+	t.logger.Infof("DELETEME: (http2Client) (tx) send_client_preface done bytes=%d", n)
 	if n != len(clientPreface) {
 		err = connectionErrorf(true, nil, "transport: preface mismatch, wrote %d bytes; want %d", n, len(clientPreface))
 		return nil, err
@@ -447,12 +458,14 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		err = connectionErrorf(true, err, "transport: failed to write initial settings frame: %v", err)
 		return nil, err
 	}
+	t.logger.Infof("DELETEME: (http2Client) (tx) write_initial_settings settings=%d initial_window=%d initial_conn_window=%d", len(ss), t.initialWindowSize, icwz)
 	// Adjust the connection flow control window if needed.
 	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
 		if err := t.framer.fr.WriteWindowUpdate(0, delta); err != nil {
 			err = connectionErrorf(true, err, "transport: failed to write window update: %v", err)
 			return nil, err
 		}
+		t.logger.Infof("DELETEME: (http2Client) (tx) write_initial_window_update delta=%d", delta)
 	}
 
 	t.connectionID = atomic.AddUint64(&clientConnectionCounter, 1)
@@ -460,12 +473,15 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 	if err := t.framer.writer.Flush(); err != nil {
 		return nil, err
 	}
+	t.logger.Infof("DELETEME: (http2Client) (tx) flush_initial_frames done")
 	// Block until the server preface is received successfully or an error occurs.
 	if err = <-readerErrCh; err != nil {
 		return nil, err
 	}
+	t.logger.Infof("DELETEME: (http2Client) (rx) server_preface_received connection_id=%d", t.connectionID)
 	go func() {
 		t.loopy = newLoopyWriter(clientSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger, t.outgoingGoAwayHandler, t.bufferPool)
+		t.logger.Infof("DELETEME: (http2Client) (tx) loopy_writer_start connection_id=%d", t.connectionID)
 		if err := t.loopy.run(); !isIOError(err) {
 			// Immediately close the connection, as the loopy writer returns
 			// when there are no more active streams and we were draining (the
@@ -473,6 +489,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 			// after draining any remaining incoming data.
 			t.conn.Close()
 		}
+		t.logger.Infof("DELETEME: (http2Client) (tx) loopy_writer_done connection_id=%d", t.connectionID)
 		close(t.writerDone)
 	}()
 	return t, nil
@@ -492,6 +509,7 @@ func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *ClientSt
 		headerChan: make(chan struct{}),
 		doneFunc:   callHdr.DoneFunc,
 	}
+	s.buf.deleteMeTraceSet(callHdr.Method, 0)
 	s.wq = newWriteQuota(defaultWriteQuota, s.done)
 	s.requestRead = func(n int) {
 		t.adjustWindow(s, uint32(n))
@@ -513,6 +531,7 @@ func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *ClientSt
 			t.updateWindow(s, uint32(n))
 		},
 	}
+	t.logger.Infof("DELETEME: (http2Client) (tx) newStream local_created method=%q send_compress=%q content_subtype=%q", callHdr.Method, callHdr.SendCompress, callHdr.ContentSubtype)
 	return s
 }
 
@@ -736,6 +755,7 @@ func (e NewStreamError) Error() string {
 // NewStream creates a stream and registers it into the transport as "active"
 // streams.  All non-nil errors returned will be *NewStreamError.
 func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error) {
+	t.logger.Infof("DELETEME: (http2Client) (tx) NewStream start method=%q host=%q authority=%q previous_stream_id=%d", callHdr.Method, callHdr.Host, callHdr.Authority, t.nextID)
 	ctx = peer.NewContext(ctx, t.getPeer())
 
 	// ServerName field of the resolver returned address takes precedence over
@@ -772,6 +792,7 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
 	if err != nil {
 		return nil, &NewStreamError{Err: err, AllowTransparentRetry: false}
 	}
+	t.logger.Infof("DELETEME: (http2Client) (tx) NewStream header_fields method=%q count=%d", callHdr.Method, len(headerFields))
 	s := t.newStream(ctx, callHdr)
 	cleanup := func(err error) {
 		if s.swapState(streamDone) == streamDone {
@@ -842,9 +863,11 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
 		transportDrainRequired = t.nextID > MaxStreamID
 
 		s.id = hdr.streamID
+		s.buf.deleteMeTraceSet(s.method, s.id)
 		s.fc = &inFlow{limit: uint32(t.initialWindowSize)}
 		t.activeStreams[s.id] = s
 		t.mu.Unlock()
+		t.logger.Infof("DELETEME: (http2Client) (tx) NewStream registered stream_id=%d method=%q active_streams=%d stream_quota=%d", s.id, s.method, len(t.activeStreams), t.streamQuota)
 
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
@@ -921,15 +944,29 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
 		}
 		t.GracefulClose()
 	}
+	t.logger.Infof("DELETEME: (http2Client) (tx) NewStream ready stream_id=%d method=%q", s.id, s.method)
 	return s, nil
 }
 
 func (t *http2Client) closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool) {
+	method, streamID, traceEnabled := deleteMeClientTransportTraceInfo(s)
+	if traceEnabled && t.logger.V(logLevel) {
+		statusCode := "<nil>"
+		statusMessage := ""
+		if st != nil {
+			statusCode = st.Code().String()
+			statusMessage = st.Message()
+		}
+		t.logger.Infof("DELETEME: (http2Client) (rx) closeStream start stream_id=%d method=%q err=%v rst=%v rst_code=%v eos_received=%v status_code=%s status_message=%q trailer_keys=%d", streamID, method, err, rst, rstCode, eosReceived, statusCode, statusMessage, len(mdata))
+	}
 	// Set stream status to done.
 	if s.swapState(streamDone) == streamDone {
 		// If it was already done, return.  If multiple closeStream calls
 		// happen simultaneously, wait for the first to finish.
 		<-s.done
+		if traceEnabled && t.logger.V(logLevel) {
+			t.logger.Infof("DELETEME: (http2Client) (rx) closeStream already_done stream_id=%d method=%q", streamID, method)
+		}
 		return
 	}
 	// status and trailers can be updated here without any synchronization because the stream goroutine will
@@ -980,6 +1017,9 @@ func (t *http2Client) closeStream(s *ClientStream, err error, rst bool, rstCode 
 	t.controlBuf.executeAndPut(addBackStreamQuota, cleanup)
 	// This will unblock write.
 	close(s.done)
+	if traceEnabled && t.logger.V(logLevel) {
+		t.logger.Infof("DELETEME: (http2Client) (rx) closeStream done stream_id=%d method=%q header_closed=%v no_headers=%v", streamID, method, atomic.LoadUint32(&s.headerChanClosed) != 0, s.noHeaders)
+	}
 	if s.doneFunc != nil {
 		s.doneFunc()
 	}
@@ -1088,16 +1128,22 @@ func (t *http2Client) GracefulClose() {
 // Write formats the data into HTTP2 data frame(s) and sends it out. The caller
 // should proceed only if Write returns nil.
 func (t *http2Client) write(s *ClientStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
+	method, streamID, _ := deleteMeClientTransportTraceInfo(s)
 	reader := data.Reader()
+	payloadLen := data.Len()
+	last := opts != nil && opts.Last
+	t.logger.Infof("DELETEME: (http2Client) (tx) write start stream_id=%d method=%q hdr_len=%d payload_len=%d last=%v state=%v", streamID, method, len(hdr), payloadLen, last, s.getState())
 
 	if opts.Last {
 		// If it's the last message, update stream state.
 		if !s.compareAndSwapState(streamActive, streamWriteDone) {
 			_ = reader.Close()
+			t.logger.Infof("DELETEME: (http2Client) (tx) write rejected stream_id=%d method=%q reason=%q", streamID, method, errStreamDone)
 			return errStreamDone
 		}
 	} else if s.getState() != streamActive {
 		_ = reader.Close()
+		t.logger.Infof("DELETEME: (http2Client) (tx) write rejected stream_id=%d method=%q reason=%q", streamID, method, errStreamDone)
 		return errStreamDone
 	}
 	df := &dataFrame{
@@ -1109,14 +1155,17 @@ func (t *http2Client) write(s *ClientStream, hdr []byte, data mem.BufferSlice, o
 	if hdr != nil || df.reader.Remaining() != 0 { // If it's not an empty data frame, check quota.
 		if err := s.wq.get(int32(len(hdr) + df.reader.Remaining())); err != nil {
 			_ = reader.Close()
+			t.logger.Infof("DELETEME: (http2Client) (tx) write quota_error stream_id=%d method=%q err=%v", streamID, method, err)
 			return err
 		}
 	}
 	if err := t.controlBuf.put(df); err != nil {
 		_ = reader.Close()
+		t.logger.Infof("DELETEME: (http2Client) (tx) write enqueue_error stream_id=%d method=%q err=%v", streamID, method, err)
 		return err
 	}
 	t.incrMsgSent()
+	t.logger.Infof("DELETEME: (http2Client) (tx) write queued stream_id=%d method=%q remaining=%d last=%v", streamID, method, df.reader.Remaining(), last)
 	return nil
 }
 
@@ -1208,8 +1257,15 @@ func (t *http2Client) handleData(f *http2.DataFrame) {
 	if s == nil {
 		return
 	}
+	method, streamID, traceEnabled := deleteMeClientTransportTraceInfo(s)
+	if traceEnabled && t.logger.V(logLevel) {
+		t.logger.Infof("DELETEME: (http2Client) (rx) handleData start stream_id=%d method=%q frame_len=%d data_len=%d end_stream=%v padded=%v", streamID, method, size, len(f.Data()), f.StreamEnded(), f.Header().Flags.Has(http2.FlagDataPadded))
+	}
 	if size > 0 {
 		if err := s.fc.onData(size); err != nil {
+			if traceEnabled && t.logger.V(logLevel) {
+				t.logger.Infof("DELETEME: (http2Client) (rx) handleData flow_control_error stream_id=%d method=%q err=%v", streamID, method, err)
+			}
 			t.closeStream(s, io.EOF, true, http2.ErrCodeFlowControl, status.New(codes.Internal, err.Error()), nil, false)
 			return
 		}
@@ -1229,11 +1285,17 @@ func (t *http2Client) handleData(f *http2.DataFrame) {
 				pool = mem.DefaultBufferPool()
 			}
 			s.write(recvMsg{buffer: mem.Copy(f.Data(), pool)})
+			if traceEnabled && t.logger.V(logLevel) {
+				t.logger.Infof("DELETEME: (http2Client) (rx) handleData queued stream_id=%d method=%q data_len=%d", streamID, method, len(f.Data()))
+			}
 		}
 	}
 	// The server has closed the stream without sending trailers.  Record that
 	// the read direction is closed, and set the status appropriately.
 	if f.StreamEnded() {
+		if traceEnabled && t.logger.V(logLevel) {
+			t.logger.Infof("DELETEME: (http2Client) (rx) handleData end_stream_without_trailers stream_id=%d method=%q", streamID, method)
+		}
 		t.closeStream(s, io.EOF, false, http2.ErrCodeNo, status.New(codes.Internal, "server closed the stream without sending trailers"), nil, true)
 	}
 }
@@ -1243,6 +1305,8 @@ func (t *http2Client) handleRSTStream(f *http2.RSTStreamFrame) {
 	if s == nil {
 		return
 	}
+	method, streamID, _ := deleteMeClientTransportTraceInfo(s)
+	t.logger.Infof("DELETEME: (http2Client) (rx) handleRSTStream start stream_id=%d method=%q code=%v", streamID, method, f.ErrCode)
 	if f.ErrCode == http2.ErrCodeRefusedStream {
 		// The stream was unprocessed by the server.
 		s.unprocessed.Store(true)
@@ -1262,13 +1326,16 @@ func (t *http2Client) handleRSTStream(f *http2.RSTStreamFrame) {
 		}
 	}
 	st := status.Newf(statusCode, "stream terminated by RST_STREAM with error code: %v", f.ErrCode)
+	t.logger.Infof("DELETEME: (http2Client) (rx) handleRSTStream closing stream_id=%d method=%q grpc_code=%s", streamID, method, st.Code().String())
 	t.closeStream(s, st.Err(), false, http2.ErrCodeNo, st, nil, false)
 }
 
 func (t *http2Client) handleSettings(f *http2.SettingsFrame, isFirst bool) {
 	if f.IsAck() {
+		t.logger.Infof("DELETEME: (http2Client) (rx) handleSettings ack")
 		return
 	}
+	t.logger.Infof("DELETEME: (http2Client) (rx) handleSettings start is_first=%v", isFirst)
 	var maxStreams *uint32
 	var ss []http2.Setting
 	var updateFuncs []func()
@@ -1312,6 +1379,11 @@ func (t *http2Client) handleSettings(f *http2.SettingsFrame, isFirst bool) {
 		}
 		return true
 	}, sf)
+	if maxStreams != nil {
+		t.logger.Infof("DELETEME: (http2Client) (rx) handleSettings applied is_first=%v max_concurrent_streams=%d passthrough_settings=%d", isFirst, *maxStreams, len(ss))
+	} else {
+		t.logger.Infof("DELETEME: (http2Client) (rx) handleSettings applied is_first=%v passthrough_settings=%d", isFirst, len(ss))
+	}
 }
 
 func (t *http2Client) handlePing(f *http2.PingFrame) {
@@ -1441,12 +1513,19 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 	if s == nil {
 		return
 	}
+	method, streamID, traceEnabled := deleteMeClientTransportTraceInfo(s)
 	endStream := frame.StreamEnded()
 	s.bytesReceived.Store(true)
 	initialHeader := atomic.LoadUint32(&s.headerChanClosed) == 0
+	if traceEnabled && t.logger.V(logLevel) {
+		t.logger.Infof("DELETEME: (http2Client) (rx) operateHeaders start stream_id=%d method=%q end_stream=%v initial_header=%v fields=%d truncated=%v", streamID, method, endStream, initialHeader, len(frame.Fields), frame.Truncated)
+	}
 
 	if !initialHeader && !endStream {
 		// As specified by gRPC over HTTP2, a HEADERS frame (and associated CONTINUATION frames) can only appear at the start or end of a stream. Therefore, second HEADERS frame must have EOS bit set.
+		if traceEnabled && t.logger.V(logLevel) {
+			t.logger.Infof("DELETEME: (http2Client) (rx) operateHeaders invalid_midstream_headers stream_id=%d method=%q", streamID, method)
+		}
 		st := status.New(codes.Internal, "a HEADERS frame cannot appear in the middle of a stream")
 		t.closeStream(s, st.Err(), true, http2.ErrCodeProtocol, st, nil, false)
 		return
@@ -1455,6 +1534,9 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 	// frame.Truncated is set to true when framer detects that the current header
 	// list size hits MaxHeaderListSize limit.
 	if frame.Truncated {
+		if traceEnabled && t.logger.V(logLevel) {
+			t.logger.Infof("DELETEME: (http2Client) (rx) operateHeaders truncated stream_id=%d method=%q", streamID, method)
+		}
 		se := status.New(codes.Internal, "peer header list size exceeded limit")
 		t.closeStream(s, se.Err(), true, http2.ErrCodeFrameSize, se, nil, endStream)
 		return
@@ -1536,6 +1618,9 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 			mdata[hf.Name] = append(mdata[hf.Name], v)
 		}
 	}
+	if traceEnabled && t.logger.V(logLevel) {
+		t.logger.Infof("DELETEME: (http2Client) (rx) operateHeaders parsed stream_id=%d method=%q end_stream=%v is_grpc=%v raw_status=%s grpc_message=%q recv_compress=%q header_error=%q http_status_err=%q content_type_err=%q metadata_keys=%d", streamID, method, endStream, isGRPC, rawStatusCode.String(), grpcMessage, recvCompress, headerError, httpStatusErr, contentTypeErr, len(mdata))
+	}
 
 	if !isGRPC || httpStatusErr != "" {
 		code := codes.Internal // when header does not include HTTP status, return INTERNAL
@@ -1583,6 +1668,9 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 				s.header = mdata
 			}
 			close(s.headerChan)
+			if traceEnabled && t.logger.V(logLevel) {
+				t.logger.Infof("DELETEME: (http2Client) (rx) operateHeaders initial_headers_applied stream_id=%d method=%q recv_compress=%q header_keys=%d", streamID, method, recvCompress, len(mdata))
+			}
 		}
 	}
 
@@ -1610,6 +1698,9 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 	}
 
 	status := istatus.NewWithProto(rawStatusCode, grpcMessage, mdata[grpcStatusDetailsBinHeader])
+	if traceEnabled && t.logger.V(logLevel) {
+		t.logger.Infof("DELETEME: (http2Client) (rx) operateHeaders trailers stream_id=%d method=%q raw_status=%s status_code=%s status_message=%q metadata_keys=%d rst_stream=%v", streamID, method, rawStatusCode.String(), status.Code().String(), status.Message(), len(mdata), s.getState() == streamActive)
+	}
 
 	// If client received END_STREAM from server while stream was still active,
 	// send RST_STREAM.
@@ -1620,6 +1711,7 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 // readServerPreface reads and handles the initial settings frame from the
 // server.
 func (t *http2Client) readServerPreface() error {
+	t.logger.Infof("DELETEME: (http2Client) (rx) readServerPreface start")
 	frame, err := t.framer.fr.ReadFrame()
 	if err != nil {
 		return connectionErrorf(true, err, "error reading server preface: %v", err)
@@ -1628,7 +1720,7 @@ func (t *http2Client) readServerPreface() error {
 	if !ok {
 		return connectionErrorf(true, nil, "initial http2 frame from server is not a settings frame: %T", frame)
 	}
-	fmt.Printf("client receives from the server Settings!\n")
+	t.logger.Infof("DELETEME: (http2Client) (rx) readServerPreface received_settings")
 	t.handleSettings(sf, true)
 	return nil
 }
@@ -1638,8 +1730,10 @@ func (t *http2Client) readServerPreface() error {
 // error is pushed to errCh; otherwise errCh is closed with no error.
 func (t *http2Client) reader(errCh chan<- error) {
 	var errClose error
+	t.logger.Infof("DELETEME: (http2Client) (rx) reader start")
 	defer func() {
 		close(t.readerDone)
+		t.logger.Infof("DELETEME: (http2Client) (rx) reader done err_close=%v", errClose)
 		if errClose != nil {
 			t.Close(errClose)
 		}
@@ -1650,6 +1744,7 @@ func (t *http2Client) reader(errCh chan<- error) {
 		return
 	}
 	close(errCh)
+	t.logger.Infof("DELETEME: (http2Client) (rx) reader preface_ok")
 	if t.keepaliveEnabled {
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 	}
@@ -1681,12 +1776,15 @@ func (t *http2Client) reader(errCh chan<- error) {
 					}
 					t.closeStream(s, status.Error(code, msg), true, http2.ErrCodeProtocol, status.New(code, msg), nil, false)
 				}
+				t.logger.Infof("DELETEME: (http2Client) (rx) reader stream_error stream_id=%d code=%v detail=%q", se.StreamID, se.Code, t.framer.fr.ErrorDetail())
 				continue
 			}
 			// Transport error.
+			t.logger.Infof("DELETEME: (http2Client) (rx) reader transport_error err=%v", err)
 			errClose = connectionErrorf(true, err, "error reading from server: %v", err)
 			return
 		}
+		t.logger.Infof("DELETEME: (http2Client) (rx) reader frame type=%T stream_id=%d", frame, frame.Header().StreamID)
 		switch frame := frame.(type) {
 		case *http2.MetaHeadersFrame:
 			t.operateHeaders(frame)

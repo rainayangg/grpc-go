@@ -61,9 +61,12 @@ type recvMsg struct {
 // interface. recvBuffer is written to much more often and using strict recvMsg
 // structs helps avoid allocation in "recvBuffer.put"
 type recvBuffer struct {
-	backlog []recvMsg
-	curIdx  int
-	err     error
+	backlog       []recvMsg
+	curIdx        int
+	err           error
+	traceMethod   string
+	traceStreamID uint32
+	traceSeq      uint64
 }
 
 func newRecvBuffer() *recvBuffer {
@@ -71,30 +74,69 @@ func newRecvBuffer() *recvBuffer {
 	return b
 }
 
+func (b *recvBuffer) deleteMeTraceSet(method string, streamID uint32) {
+	b.traceMethod = method
+	b.traceStreamID = streamID
+}
+
+func (b *recvBuffer) deleteMeTraceNextSeq() uint64 {
+	return atomic.AddUint64(&b.traceSeq, 1)
+}
+
 func (b *recvBuffer) put(r recvMsg) {
+	seq := b.deleteMeTraceNextSeq()
+	bufferLen := 0
+	if r.buffer != nil {
+		bufferLen = r.buffer.Len()
+	}
+	fmt.Printf("DELETEME: (recvBuffer) (rx) put_start seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d existing_err=%v incoming_err=%v incoming_buf_len=%d\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err, r.err, bufferLen)
 	if b.err != nil {
 		if r.buffer != nil {
 			r.buffer.Free()
 		}
+		seq := b.deleteMeTraceNextSeq()
+		fmt.Printf("DELETEME: (recvBuffer) (rx) put_dropped seq=%d recv=%p stream_id=%d method=%q reason_existing_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.err)
 		return
 	}
 	if r.err != nil {
 		b.err = r.err
 	}
+	seq = b.deleteMeTraceNextSeq()
+	fmt.Printf("DELETEME: (recvBuffer) (rx) put_before_append seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
 	b.backlog = append(b.backlog, r)
+	seq = b.deleteMeTraceNextSeq()
+	fmt.Printf("DELETEME: (recvBuffer) (rx) put_after_append seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
+	seq = b.deleteMeTraceNextSeq()
+	fmt.Printf("DELETEME: (recvBuffer) (rx) put_done seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
 }
 
 func (b *recvBuffer) next() recvMsg {
+	seq := b.deleteMeTraceNextSeq()
+	fmt.Printf("DELETEME: (recvBuffer) (rx) next_start seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
+	seq = b.deleteMeTraceNextSeq()
+	fmt.Printf("DELETEME: (recvBuffer) (rx) next_before_empty_check seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
 	if b.curIdx >= len(b.backlog) {
 		// Either EOF or nothing left
 		if b.err != nil {
+			seq = b.deleteMeTraceNextSeq()
+			fmt.Printf("DELETEME: (recvBuffer) (rx) next_returning_latched_err seq=%d recv=%p stream_id=%d method=%q err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.err)
 			return recvMsg{err: b.err}
 		}
+		seq = b.deleteMeTraceNextSeq()
+		fmt.Printf("DELETEME: (recvBuffer) (rx) next_returning_synth_eof seq=%d recv=%p stream_id=%d method=%q\n", seq, b, b.traceStreamID, b.traceMethod)
 		return recvMsg{err: io.EOF}
 	}
 	m := b.backlog[b.curIdx]
+	seq = b.deleteMeTraceNextSeq()
+	fmt.Printf("DELETEME: (recvBuffer) (rx) next_before_take seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d item_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), m.err)
 	b.backlog[b.curIdx] = recvMsg{}
 	b.curIdx++
+	bufferLen := 0
+	if m.buffer != nil {
+		bufferLen = m.buffer.Len()
+	}
+	seq = b.deleteMeTraceNextSeq()
+	fmt.Printf("DELETEME: (recvBuffer) (rx) next_returning_item seq=%d recv=%p stream_id=%d method=%q new_cur_idx=%d backlog_len=%d item_err=%v item_buf_len=%d\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), m.err, bufferLen)
 	return m
 }
 
@@ -111,10 +153,20 @@ type recvBufferReader struct {
 
 func (r *recvBufferReader) ReadMessageHeader(header []byte) (n int, err error) {
 	if r.err != nil {
+		if r.recv != nil {
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_sticky_err stream_id=%d method=%q err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, r.err)
+		}
 		return 0, r.err
 	}
 	if r.last != nil {
 		n, r.last = mem.ReadUnsafe(header, r.last)
+		if r.recv != nil {
+			remaining := 0
+			if r.last != nil {
+				remaining = r.last.Len()
+			}
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_from_last stream_id=%d method=%q n=%d remaining_last=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, remaining)
+		}
 		return n, nil
 	}
 	// No leftover → read next recvMsg
@@ -128,6 +180,9 @@ func (r *recvBufferReader) ReadMessageHeader(header []byte) (n int, err error) {
 // error.
 func (r *recvBufferReader) Read(n int) (buf mem.Buffer, err error) {
 	if r.err != nil {
+		if r.recv != nil {
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_sticky_err stream_id=%d method=%q want=%d err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, n, r.err)
+		}
 		return nil, r.err
 	}
 	if r.last != nil {
@@ -136,6 +191,13 @@ func (r *recvBufferReader) Read(n int) (buf mem.Buffer, err error) {
 			buf, r.last = mem.SplitUnsafe(buf, n)
 		} else {
 			r.last = nil
+		}
+		if r.recv != nil {
+			remaining := 0
+			if r.last != nil {
+				remaining = r.last.Len()
+			}
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_from_last stream_id=%d method=%q want=%d got=%d remaining_last=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, buf.Len(), remaining)
 		}
 		return buf, nil
 	}
@@ -204,10 +266,20 @@ func (r *recvBufferReader) readMessageHeaderAdditional(m recvMsg, header []byte)
 			m.buffer.Free()
 		}
 		r.err = m.err
+		if r.recv != nil {
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_additional_err stream_id=%d method=%q err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, m.err)
+		}
 		return 0, m.err
 	}
 
 	n, r.last = mem.ReadUnsafe(header, m.buffer)
+	if r.recv != nil {
+		remaining := 0
+		if r.last != nil {
+			remaining = r.last.Len()
+		}
+		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_additional_ok stream_id=%d method=%q n=%d remaining_last=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, remaining)
+	}
 	return n, nil
 }
 
@@ -216,11 +288,21 @@ func (r *recvBufferReader) readAdditional(m recvMsg, n int) (b mem.Buffer, err e
 		if m.buffer != nil {
 			m.buffer.Free()
 		}
+		if r.recv != nil {
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_additional_err stream_id=%d method=%q want=%d err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.err)
+		}
 		return nil, m.err
 	}
 
 	if m.buffer.Len() > n {
 		m.buffer, r.last = mem.SplitUnsafe(m.buffer, n)
+	}
+	if r.recv != nil {
+		remaining := 0
+		if r.last != nil {
+			remaining = r.last.Len()
+		}
+		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_additional_ok stream_id=%d method=%q want=%d got=%d remaining_last=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.buffer.Len(), remaining)
 	}
 	return m.buffer, nil
 }
@@ -289,7 +371,13 @@ func (s *Stream) Method() string {
 	return s.method
 }
 
+// ID returns the transport stream identifier.
+func (s *Stream) ID() uint32 {
+	return s.id
+}
+
 func (s *Stream) write(m recvMsg) {
+	s.buf.deleteMeTraceSet(s.method, s.id)
 	s.buf.put(m)
 }
 
