@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,8 +62,9 @@ type recvMsg struct {
 // interface. recvBuffer is written to much more often and using strict recvMsg
 // structs helps avoid allocation in "recvBuffer.put"
 type recvBuffer struct {
+	c             chan recvMsg
+	mu            sync.Mutex
 	backlog       []recvMsg
-	curIdx        int
 	err           error
 	traceMethod   string
 	traceStreamID uint32
@@ -70,7 +72,9 @@ type recvBuffer struct {
 }
 
 func newRecvBuffer() *recvBuffer {
-	b := &recvBuffer{curIdx: 0}
+	b := &recvBuffer{
+		c: make(chan recvMsg, 1),
+	}
 	return b
 }
 
@@ -89,55 +93,80 @@ func (b *recvBuffer) put(r recvMsg) {
 	if r.buffer != nil {
 		bufferLen = r.buffer.Len()
 	}
-	fmt.Printf("DELETEME: (recvBuffer) (rx) put_start seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d existing_err=%v incoming_err=%v incoming_buf_len=%d\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err, r.err, bufferLen)
+	b.mu.Lock()
+	fmt.Printf("DELETEME: (recvBuffer) (rx) put_start seq=%d recv=%p stream_id=%d method=%q backlog_len=%d existing_err=%v incoming_err=%v incoming_buf_len=%d\n", seq, b, b.traceStreamID, b.traceMethod, len(b.backlog), b.err, r.err, bufferLen)
 	if b.err != nil {
 		if r.buffer != nil {
 			r.buffer.Free()
 		}
-		seq := b.deleteMeTraceNextSeq()
-		fmt.Printf("DELETEME: (recvBuffer) (rx) put_dropped seq=%d recv=%p stream_id=%d method=%q reason_existing_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.err)
+		err := b.err
+		b.mu.Unlock()
+		seq = b.deleteMeTraceNextSeq()
+		fmt.Printf("DELETEME: (recvBuffer) (rx) put_dropped seq=%d recv=%p stream_id=%d method=%q reason_existing_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, err)
 		return
 	}
 	if r.err != nil {
 		b.err = r.err
 	}
 	seq = b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) put_before_append seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
+	fmt.Printf("DELETEME: (recvBuffer) (rx) put_before_enqueue seq=%d recv=%p stream_id=%d method=%q backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, len(b.backlog), b.err)
+	if len(b.backlog) == 0 {
+		select {
+		case b.c <- r:
+			latchedErr := b.err
+			b.mu.Unlock()
+			seq = b.deleteMeTraceNextSeq()
+			fmt.Printf("DELETEME: (recvBuffer) (rx) put_direct_to_chan seq=%d recv=%p stream_id=%d method=%q latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, latchedErr)
+			return
+		default:
+		}
+	}
 	b.backlog = append(b.backlog, r)
+	backlogLen := len(b.backlog)
+	latchedErr := b.err
+	b.mu.Unlock()
 	seq = b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) put_after_append seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
-	seq = b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) put_done seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
+	fmt.Printf("DELETEME: (recvBuffer) (rx) put_backlog_append seq=%d recv=%p stream_id=%d method=%q backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, backlogLen, latchedErr)
 }
 
-func (b *recvBuffer) next() recvMsg {
+func (b *recvBuffer) load() {
+	b.mu.Lock()
 	seq := b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) next_start seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
-	seq = b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) next_before_empty_check seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), b.err)
-	if b.curIdx >= len(b.backlog) {
-		// Either EOF or nothing left
-		if b.err != nil {
+	fmt.Printf("DELETEME: (recvBuffer) (rx) load_start seq=%d recv=%p stream_id=%d method=%q backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, len(b.backlog), b.err)
+	if len(b.backlog) > 0 {
+		msg := b.backlog[0]
+		select {
+		case b.c <- msg:
+			b.backlog[0] = recvMsg{}
+			b.backlog = b.backlog[1:]
+			bufferLen := 0
+			if msg.buffer != nil {
+				bufferLen = msg.buffer.Len()
+			}
+			remaining := len(b.backlog)
+			latchedErr := b.err
+			b.mu.Unlock()
 			seq = b.deleteMeTraceNextSeq()
-			fmt.Printf("DELETEME: (recvBuffer) (rx) next_returning_latched_err seq=%d recv=%p stream_id=%d method=%q err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.err)
-			return recvMsg{err: b.err}
+			fmt.Printf("DELETEME: (recvBuffer) (rx) load_sent seq=%d recv=%p stream_id=%d method=%q remaining_backlog=%d latched_err=%v item_err=%v item_buf_len=%d\n", seq, b, b.traceStreamID, b.traceMethod, remaining, latchedErr, msg.err, bufferLen)
+			return
+		default:
 		}
-		seq = b.deleteMeTraceNextSeq()
-		fmt.Printf("DELETEME: (recvBuffer) (rx) next_returning_synth_eof seq=%d recv=%p stream_id=%d method=%q\n", seq, b, b.traceStreamID, b.traceMethod)
-		return recvMsg{err: io.EOF}
 	}
-	m := b.backlog[b.curIdx]
+	backlogLen := len(b.backlog)
+	latchedErr := b.err
+	b.mu.Unlock()
 	seq = b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) next_before_take seq=%d recv=%p stream_id=%d method=%q cur_idx=%d backlog_len=%d item_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), m.err)
-	b.backlog[b.curIdx] = recvMsg{}
-	b.curIdx++
-	bufferLen := 0
-	if m.buffer != nil {
-		bufferLen = m.buffer.Len()
-	}
-	seq = b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) next_returning_item seq=%d recv=%p stream_id=%d method=%q new_cur_idx=%d backlog_len=%d item_err=%v item_buf_len=%d\n", seq, b, b.traceStreamID, b.traceMethod, b.curIdx, len(b.backlog), m.err, bufferLen)
-	return m
+	fmt.Printf("DELETEME: (recvBuffer) (rx) load_noop seq=%d recv=%p stream_id=%d method=%q backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, backlogLen, latchedErr)
+}
+
+// get returns the channel that receives a recvMsg in the buffer.
+//
+// Upon receipt of a recvMsg, the caller should call load to send another
+// recvMsg onto the channel if there is any.
+func (b *recvBuffer) get() <-chan recvMsg {
+	seq := b.deleteMeTraceNextSeq()
+	fmt.Printf("DELETEME: (recvBuffer) (rx) get_chan seq=%d recv=%p stream_id=%d method=%q\n", seq, b, b.traceStreamID, b.traceMethod)
+	return b.c
 }
 
 // recvBufferReader implements io.Reader interface to read the data from
@@ -169,9 +198,12 @@ func (r *recvBufferReader) ReadMessageHeader(header []byte) (n int, err error) {
 		}
 		return n, nil
 	}
-	// No leftover → read next recvMsg
-	m := r.recv.next()
-	return r.readMessageHeaderAdditional(m, header)
+	if r.closeStream != nil {
+		n, r.err = r.readMessageHeaderClient(header)
+	} else {
+		n, r.err = r.readMessageHeader(header)
+	}
+	return n, r.err
 }
 
 // Read reads the next n bytes from last. If last is drained, it tries to read
@@ -201,71 +233,126 @@ func (r *recvBufferReader) Read(n int) (buf mem.Buffer, err error) {
 		}
 		return buf, nil
 	}
-	// No leftover → read next recvMsg
-	m := r.recv.next()
-	return r.readAdditional(m, n)
+	if r.closeStream != nil {
+		buf, r.err = r.readClient(n)
+	} else {
+		buf, r.err = r.read(n)
+	}
+	return buf, r.err
 }
 
-// func (r *recvBufferReader) readMessageHeaderClient(header []byte) (n int, err error) {
-// 	// If the context is canceled, then closes the stream with nil metadata.
-// 	// closeStream writes its error parameter to r.recv as a recvMsg.
-// 	// r.readAdditional acts on that message and returns the necessary error.
-// 	select {
-// 	case <-r.ctxDone:
-// 		// Note that this adds the ctx error to the end of recv buffer, and
-// 		// reads from the head. This will delay the error until recv buffer is
-// 		// empty, thus will delay ctx cancellation in Recv().
-// 		//
-// 		// It's done this way to fix a race between ctx cancel and trailer. The
-// 		// race was, stream.Recv() may return ctx error if ctxDone wins the
-// 		// race, but stream.Trailer() may return a non-nil md because the stream
-// 		// was not marked as done when trailer is received. This closeStream
-// 		// call will mark stream as done, thus fix the race.
-// 		//
-// 		// TODO: delaying ctx error seems like a unnecessary side effect. What
-// 		// we really want is to mark the stream as done, and return ctx error
-// 		// faster.
-// 		r.closeStream(ContextErr(r.ctx.Err()))
-// 		m := <-r.recv.get()
-// 		return r.readMessageHeaderAdditional(m, header)
-// 	case m := <-r.recv.get():
-// 		return r.readMessageHeaderAdditional(m, header)
-// 	}
-// }
+func (r *recvBufferReader) readMessageHeader(header []byte) (n int, err error) {
+	if r.recv != nil {
+		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_wait stream_id=%d method=%q\n", r.recv.traceStreamID, r.recv.traceMethod)
+	}
+	select {
+	case <-r.ctxDone:
+		if r.recv != nil {
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_ctx_done stream_id=%d method=%q err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, r.ctx.Err())
+		}
+		return 0, ContextErr(r.ctx.Err())
+	case m := <-r.recv.get():
+		if r.recv != nil {
+			bufferLen := 0
+			if m.buffer != nil {
+				bufferLen = m.buffer.Len()
+			}
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_received stream_id=%d method=%q msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, m.err, bufferLen)
+		}
+		return r.readMessageHeaderAdditional(m, header)
+	}
+}
 
-// func (r *recvBufferReader) readClient(n int) (buf mem.Buffer, err error) {
-// 	// If the context is canceled, then closes the stream with nil metadata.
-// 	// closeStream writes its error parameter to r.recv as a recvMsg.
-// 	// r.readAdditional acts on that message and returns the necessary error.
-// 	select {
-// 	case <-r.ctxDone:
-// 		// Note that this adds the ctx error to the end of recv buffer, and
-// 		// reads from the head. This will delay the error until recv buffer is
-// 		// empty, thus will delay ctx cancellation in Recv().
-// 		//
-// 		// It's done this way to fix a race between ctx cancel and trailer. The
-// 		// race was, stream.Recv() may return ctx error if ctxDone wins the
-// 		// race, but stream.Trailer() may return a non-nil md because the stream
-// 		// was not marked as done when trailer is received. This closeStream
-// 		// call will mark stream as done, thus fix the race.
-// 		//
-// 		// TODO: delaying ctx error seems like a unnecessary side effect. What
-// 		// we really want is to mark the stream as done, and return ctx error
-// 		// faster.
-// 		r.closeStream(ContextErr(r.ctx.Err()))
-// 		m := <-r.recv.get()
-// 		return r.readAdditional(m, n)
-// 	case m := <-r.recv.get():
-// 		return r.readAdditional(m, n)
-// 	}
-// }
+func (r *recvBufferReader) read(n int) (buf mem.Buffer, err error) {
+	if r.recv != nil {
+		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_wait stream_id=%d method=%q want=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n)
+	}
+	select {
+	case <-r.ctxDone:
+		if r.recv != nil {
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_ctx_done stream_id=%d method=%q want=%d err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, n, r.ctx.Err())
+		}
+		return nil, ContextErr(r.ctx.Err())
+	case m := <-r.recv.get():
+		if r.recv != nil {
+			bufferLen := 0
+			if m.buffer != nil {
+				bufferLen = m.buffer.Len()
+			}
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_received stream_id=%d method=%q want=%d msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.err, bufferLen)
+		}
+		return r.readAdditional(m, n)
+	}
+}
+
+func (r *recvBufferReader) readMessageHeaderClient(header []byte) (n int, err error) {
+	if r.recv != nil {
+		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_client_wait stream_id=%d method=%q\n", r.recv.traceStreamID, r.recv.traceMethod)
+	}
+	select {
+	case <-r.ctxDone:
+		if r.recv != nil {
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_client_ctx_done stream_id=%d method=%q err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, r.ctx.Err())
+		}
+		r.closeStream(ContextErr(r.ctx.Err()))
+		m := <-r.recv.get()
+		if r.recv != nil {
+			bufferLen := 0
+			if m.buffer != nil {
+				bufferLen = m.buffer.Len()
+			}
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_client_received_after_close stream_id=%d method=%q msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, m.err, bufferLen)
+		}
+		return r.readMessageHeaderAdditional(m, header)
+	case m := <-r.recv.get():
+		if r.recv != nil {
+			bufferLen := 0
+			if m.buffer != nil {
+				bufferLen = m.buffer.Len()
+			}
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_client_received stream_id=%d method=%q msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, m.err, bufferLen)
+		}
+		return r.readMessageHeaderAdditional(m, header)
+	}
+}
+
+func (r *recvBufferReader) readClient(n int) (buf mem.Buffer, err error) {
+	if r.recv != nil {
+		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_client_wait stream_id=%d method=%q want=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n)
+	}
+	select {
+	case <-r.ctxDone:
+		if r.recv != nil {
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_client_ctx_done stream_id=%d method=%q want=%d err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, n, r.ctx.Err())
+		}
+		r.closeStream(ContextErr(r.ctx.Err()))
+		m := <-r.recv.get()
+		if r.recv != nil {
+			bufferLen := 0
+			if m.buffer != nil {
+				bufferLen = m.buffer.Len()
+			}
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_client_received_after_close stream_id=%d method=%q want=%d msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.err, bufferLen)
+		}
+		return r.readAdditional(m, n)
+	case m := <-r.recv.get():
+		if r.recv != nil {
+			bufferLen := 0
+			if m.buffer != nil {
+				bufferLen = m.buffer.Len()
+			}
+			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_client_received stream_id=%d method=%q want=%d msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.err, bufferLen)
+		}
+		return r.readAdditional(m, n)
+	}
+}
 
 func (r *recvBufferReader) readMessageHeaderAdditional(m recvMsg, header []byte) (n int, err error) {
+	r.recv.load()
 	if m.err != nil {
 		if m.buffer != nil {
 			m.buffer.Free()
 		}
-		r.err = m.err
 		if r.recv != nil {
 			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_additional_err stream_id=%d method=%q err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, m.err)
 		}
@@ -284,6 +371,7 @@ func (r *recvBufferReader) readMessageHeaderAdditional(m recvMsg, header []byte)
 }
 
 func (r *recvBufferReader) readAdditional(m recvMsg, n int) (b mem.Buffer, err error) {
+	r.recv.load()
 	if m.err != nil {
 		if m.buffer != nil {
 			m.buffer.Free()
