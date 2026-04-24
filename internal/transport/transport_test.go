@@ -367,7 +367,7 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 		if serverConfig.MaxStreams == 0 {
 			serverConfig.MaxStreams = math.MaxUint32
 		}
-		transport, err := NewServerTransport(conn, serverConfig)
+		transport, err := NewServerTransport(conn, serverConfig, false, false)
 		if err != nil {
 			return
 		}

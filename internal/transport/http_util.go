@@ -392,9 +392,10 @@ func toIOError(err error) error {
 }
 
 type framer struct {
-	writer *bufWriter
-	fr     *http2.Framer
-	komafr *http2.KomaFramer
+	writer   *bufWriter
+	fr       *http2.Framer
+	komafrRx *http2.KomaFramer
+	komafrTx *http2.KomaFramer
 }
 
 var (
@@ -431,18 +432,42 @@ func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, sharedWriteBu
 
 	} else {
 		f = &framer{
-			writer: w,
-			komafr: http2.NewKomaFramer(conn),
+			writer:   w,
+			komafrRx: http2.NewKomaFramer(conn),
+			komafrTx: http2.NewKomaFramer(conn),
 		}
-		f.komafr.SetMaxReadFrameSize(http2MaxFrameLen)
-		// Opt-in to Frame reuse API on framer to reduce garbage.
-		// Frames aren't safe to read from after a subsequent call to ReadFrame.
-		f.komafr.SetReuseFrames()
-		f.komafr.MaxHeaderListSize = maxHeaderListSize
-		f.komafr.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
+		f.komafrRx.SetMaxReadFrameSize(http2MaxFrameLen)
+		f.komafrRx.SetReuseFrames()
+		f.komafrRx.MaxHeaderListSize = maxHeaderListSize
+		f.komafrRx.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
+
+		f.komafrTx.SetMaxReadFrameSize(http2MaxFrameLen)
+		f.komafrTx.SetReuseFrames()
+		f.komafrTx.MaxHeaderListSize = maxHeaderListSize
+		f.komafrTx.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
 
 	}
 	return f
+}
+
+func (f *framer) komaReader() *http2.KomaFramer {
+	if f == nil {
+		return nil
+	}
+	if f.komafrRx != nil {
+		return f.komafrRx
+	}
+	return f.komafrTx
+}
+
+func (f *framer) komaWriter() *http2.KomaFramer {
+	if f == nil {
+		return nil
+	}
+	if f.komafrTx != nil {
+		return f.komafrTx
+	}
+	return f.komafrRx
 }
 
 func getWriteBufferPool(size int) *sync.Pool {

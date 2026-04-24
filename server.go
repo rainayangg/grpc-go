@@ -103,9 +103,19 @@ var (
 )
 
 const (
+	grpcKomaEnabledEnvName        = "GRPC_KOMA_ENABLED"
 	grpcKomaCoresEnvName          = "GRPC_KOMA_CORES"
+	grpcKomaNumWorkersEnvName     = "GRPC_KOMA_NUM_WORKERS"
+	grpcKomaThreadingModelEnvName = "GRPC_KOMA_THREADING_MODEL"
 	grpcKomaWorkersPerCoreEnvName = "GRPC_KOMA_WORKERS_PER_CORE"
 	grpcKomaWorkerModeEnvName     = "GRPC_KOMA_WORKER_MODE"
+)
+
+type KomaThreadingModeValue string
+
+const (
+	KomaRTC  KomaThreadingModeValue = "rtc"
+	KomaAsym KomaThreadingModeValue = "asym"
 )
 
 type komaWorkerMode string
@@ -119,12 +129,69 @@ type komaConfig struct {
 	enabled        bool
 	cores          []int
 	numWorkers     uint32
+	threadingMode  KomaThreadingModeValue
 	workersPerCore int
 	workerMode     komaWorkerMode
 }
 
-func parseKomaConfig(coresEnv, workersPerCoreEnv, workerModeEnv string, configuredWorkers uint32) (komaConfig, error) {
-	cfg := komaConfig{workerMode: komaWorkerModePinned}
+func parseKomaEnabled(enabledEnv string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(enabledEnv)) {
+	case "":
+		return false, nil
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid %s value %q: must be one of 1, true, yes, on, 0, false, no, off", grpcKomaEnabledEnvName, enabledEnv)
+	}
+}
+
+func parseKomaThreadingMode(threadingModelEnv string) (KomaThreadingModeValue, error) {
+	switch strings.ToLower(strings.TrimSpace(threadingModelEnv)) {
+	case "", "rtc", "symmetric", "sym":
+		return KomaRTC, nil
+	case "asym", "asymmetric":
+		return KomaAsym, nil
+	default:
+		return "", fmt.Errorf("invalid %s value %q: must be one of rtc, symmetric, asym, asymmetric", grpcKomaThreadingModelEnvName, threadingModelEnv)
+	}
+}
+
+func parseKomaConfig(enabledEnv, coresEnv, numWorkersEnv, threadingModelEnv, workersPerCoreEnv, workerModeEnv string, configuredWorkers uint32) (komaConfig, error) {
+	cfg := komaConfig{
+		threadingMode: KomaRTC,
+		workerMode:    komaWorkerModePinned,
+	}
+	enabled, err := parseKomaEnabled(enabledEnv)
+	if err != nil {
+		return komaConfig{}, err
+	}
+	cfg.enabled = enabled
+
+	threadingMode, err := parseKomaThreadingMode(threadingModelEnv)
+	if err != nil {
+		return komaConfig{}, err
+	}
+	cfg.threadingMode = threadingMode
+
+	if !cfg.enabled {
+		switch {
+		case coresEnv != "":
+			return komaConfig{}, fmt.Errorf("%s is set but %s is not enabled", grpcKomaCoresEnvName, grpcKomaEnabledEnvName)
+		case numWorkersEnv != "":
+			return komaConfig{}, fmt.Errorf("%s is set but %s is not enabled", grpcKomaNumWorkersEnvName, grpcKomaEnabledEnvName)
+		case threadingModelEnv != "":
+			return komaConfig{}, fmt.Errorf("%s is set but %s is not enabled", grpcKomaThreadingModelEnvName, grpcKomaEnabledEnvName)
+		case workersPerCoreEnv != "":
+			return komaConfig{}, fmt.Errorf("%s is set but %s is not enabled", grpcKomaWorkersPerCoreEnvName, grpcKomaEnabledEnvName)
+		case workerModeEnv != "":
+			return komaConfig{}, fmt.Errorf("%s is set but %s is not enabled", grpcKomaWorkerModeEnvName, grpcKomaEnabledEnvName)
+		default:
+			return cfg, nil
+		}
+	}
+
 	if workerModeEnv != "" {
 		cfg.workerMode = komaWorkerMode(workerModeEnv)
 		switch cfg.workerMode {
@@ -134,15 +201,36 @@ func parseKomaConfig(coresEnv, workersPerCoreEnv, workerModeEnv string, configur
 		}
 	}
 
+	var envNumWorkers uint32
+	if numWorkersEnv != "" {
+		if configuredWorkers != 0 {
+			return komaConfig{}, fmt.Errorf("%s and NumStreamWorkers cannot both be set", grpcKomaNumWorkersEnvName)
+		}
+		numWorkers, err := strconv.Atoi(strings.TrimSpace(numWorkersEnv))
+		if err != nil || numWorkers <= 0 {
+			return komaConfig{}, fmt.Errorf("invalid %s value %q: must be a positive integer", grpcKomaNumWorkersEnvName, numWorkersEnv)
+		}
+		envNumWorkers = uint32(numWorkers)
+	}
+
 	if coresEnv == "" {
 		switch {
 		case workersPerCoreEnv != "":
 			return komaConfig{}, fmt.Errorf("%s is set but %s is not", grpcKomaWorkersPerCoreEnvName, grpcKomaCoresEnvName)
 		case workerModeEnv != "":
 			return komaConfig{}, fmt.Errorf("%s is set but %s is not", grpcKomaWorkerModeEnvName, grpcKomaCoresEnvName)
+		case envNumWorkers != 0:
+			cfg.numWorkers = envNumWorkers
+		case configuredWorkers != 0:
+			cfg.numWorkers = configuredWorkers
 		default:
-			return cfg, nil
+			cfg.numWorkers = uint32(runtime.GOMAXPROCS(0))
+			if cfg.numWorkers == 0 {
+				cfg.numWorkers = 1
+			}
 		}
+		cfg.workerMode = komaWorkerModeRuntime
+		return cfg, nil
 	}
 
 	cfg.enabled = true
@@ -155,8 +243,8 @@ func parseKomaConfig(coresEnv, workersPerCoreEnv, workerModeEnv string, configur
 	}
 
 	if workersPerCoreEnv != "" {
-		if configuredWorkers != 0 {
-			return komaConfig{}, fmt.Errorf("%s and NumStreamWorkers cannot both be set", grpcKomaWorkersPerCoreEnvName)
+		if configuredWorkers != 0 || envNumWorkers != 0 {
+			return komaConfig{}, fmt.Errorf("%s cannot be combined with %s or NumStreamWorkers", grpcKomaWorkersPerCoreEnvName, grpcKomaNumWorkersEnvName)
 		}
 		workersPerCore, err := strconv.Atoi(strings.TrimSpace(workersPerCoreEnv))
 		if err != nil || workersPerCore <= 0 {
@@ -164,6 +252,11 @@ func parseKomaConfig(coresEnv, workersPerCoreEnv, workerModeEnv string, configur
 		}
 		cfg.workersPerCore = workersPerCore
 		cfg.numWorkers = uint32(len(cfg.cores) * workersPerCore)
+		return cfg, nil
+	}
+
+	if envNumWorkers != 0 {
+		cfg.numWorkers = envNumWorkers
 		return cfg, nil
 	}
 
@@ -233,9 +326,10 @@ type Server struct {
 	serverWorkerChannel      chan func()
 	serverWorkerChannelClose func()
 	komafds                  []int // all koma sockets belonging to this server
-	komaEnabled              bool  // whether koma is enabled (set via GRPC_KOMA_CORES env var)
+	komaEnabled              bool
 	komaCores                []int // CPU cores for koma workers
 	komaWorkerMode           komaWorkerMode
+	komaThreadingMode        KomaThreadingModeValue
 }
 
 type serverOptions struct {
@@ -267,6 +361,7 @@ type serverOptions struct {
 	numServerWorkers      uint32
 	bufferPool            mem.BufferPool
 	waitForHandlers       bool
+	komaThreadingMode     KomaThreadingModeValue
 }
 
 var defaultServerOptions = serverOptions{
@@ -277,6 +372,7 @@ var defaultServerOptions = serverOptions{
 	writeBufferSize:       defaultWriteBufSize,
 	readBufferSize:        defaultReadBufSize,
 	bufferPool:            mem.DefaultBufferPool(),
+	komaThreadingMode:     KomaRTC,
 }
 
 const (
@@ -693,6 +789,19 @@ func NumStreamWorkers(numServerWorkers uint32) ServerOption {
 	})
 }
 
+// KomaThreadingMode selects the Koma server threading architecture. The
+// default is KomaRTC, which preserves the current run-to-completion behavior.
+//
+// # Experimental
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a
+// later release.
+func KomaThreadingMode(mode KomaThreadingModeValue) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		o.komaThreadingMode = mode
+	})
+}
+
 // WaitForHandlers cause Stop to wait until all outstanding method handlers have
 // exited before returning.  If false, Stop will return as soon as all
 // connections have closed, but method handlers may still be running. By
@@ -736,7 +845,7 @@ func PinThreadToCPU(cpuID int) error {
 //
 // [1] https://github.com/golang/go/issues/18138
 func (s *Server) serverWorker(workerID int, cpuID int) {
-	if s.komaWorkerMode == komaWorkerModePinned {
+	if s.komaWorkerMode == komaWorkerModePinned && cpuID >= 0 {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		if err := PinThreadToCPU(cpuID); err != nil {
@@ -786,16 +895,136 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 	logger.Infof("DELETEME: (server) (rx) serverWorker handle_streams_done worker_id=%d komafd=%d", workerID, komafd)
 }
 
-// initServerWorkers creates worker goroutines and a channel to process incoming
-// connections to reduce the time spent overall on runtime.morestack.
-func (s *Server) initServerWorkers() {
+func (s *Server) komaWorkerCPU(workerID int) int {
+	if len(s.komaCores) == 0 {
+		return -1
+	}
+	return s.komaCores[workerID%len(s.komaCores)]
+}
+
+func (s *Server) handleStreamWorker(workerID int, cpuID int) {
+	if s.komaWorkerMode == komaWorkerModePinned && cpuID >= 0 {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := PinThreadToCPU(cpuID); err != nil {
+			panic(err)
+		}
+		logger.Infof("DELETEME: (server) (rx) handleStreamWorker pinned worker_id=%d cpu_id=%d mode=%q", workerID, cpuID, s.komaWorkerMode)
+	}
+	logger.Infof("DELETEME: (server) (rx) handleStreamWorker start worker_id=%d cpu_id=%d mode=%q", workerID, cpuID, s.komaWorkerMode)
+	for completed := 0; completed < serverWorkerResetThreshold; completed++ {
+		f, ok := <-s.serverWorkerChannel
+		if !ok {
+			logger.Infof("DELETEME: (server) (rx) handleStreamWorker stop worker_id=%d cpu_id=%d", workerID, cpuID)
+			return
+		}
+		f()
+	}
+	go s.handleStreamWorker(workerID, cpuID)
+}
+
+func (s *Server) initStreamWorkers() {
+	if s.serverWorkerChannel != nil {
+		return
+	}
 	s.serverWorkerChannel = make(chan func())
 	s.serverWorkerChannelClose = sync.OnceFunc(func() {
 		close(s.serverWorkerChannel)
 	})
 	for i := 0; i < int(s.opts.numServerWorkers); i++ {
-		go s.serverWorker(i, s.komaCores[i%len(s.komaCores)])
+		go s.handleStreamWorker(i, s.komaWorkerCPU(i))
 	}
+}
+
+// initServerWorkers creates RTC Koma workers.
+func (s *Server) initServerWorkers() {
+	for i := 0; i < int(s.opts.numServerWorkers); i++ {
+		go s.serverWorker(i, s.komaWorkerCPU(i))
+	}
+}
+
+func (s *Server) dispatchKomaStream(streamQuota *atomicSemaphore, st transport.ServerTransport, stream *transport.ServerStream) {
+	s.handlersWG.Add(1)
+	streamQuota.acquire()
+	f := func() {
+		defer streamQuota.release()
+		defer s.handlersWG.Done()
+		s.handleStream(st, stream)
+	}
+
+	if s.serverWorkerChannel != nil {
+		select {
+		case s.serverWorkerChannel <- f:
+			return
+		default:
+			// If all workers are busy, fallback to the default code path.
+		}
+	}
+	go f()
+}
+
+func (s *Server) startKomaAsym() {
+	s.initStreamWorkers()
+	go s.komaAsymIOWorker()
+}
+
+func (s *Server) komaAsymIOWorker() {
+	ioCPU := s.komaWorkerCPU(0)
+	if s.komaWorkerMode == komaWorkerModePinned && ioCPU >= 0 {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := PinThreadToCPU(ioCPU); err != nil {
+			panic(err)
+		}
+		logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker pinned cpu_id=%d mode=%q", ioCPU, s.komaWorkerMode)
+	}
+	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker start cpu_id=%d mode=%q", ioCPU, s.komaWorkerMode)
+
+	komafd := koma.KomaInit()
+	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker koma_init cpu_id=%d komafd=%d", ioCPU, komafd)
+
+	s.mu.Lock()
+	s.komafds = append(s.komafds, komafd)
+	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker registered_koma_fd komafd=%d total_komafds=%d", komafd, len(s.komafds))
+	s.mu.Unlock()
+
+	komaConn, err := http2.NewKomaConn(komafd)
+	if err != nil {
+		panic(err)
+	}
+	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker koma_conn_ready komafd=%d conn=%p", komafd, komaConn)
+	if err := komaConn.SetRequireReplyCookie(true); err != nil {
+		panic(err)
+	}
+	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker require_reply_cookie_enabled komafd=%d", komafd)
+
+	st := s.newHTTP2Transport(komaConn, true)
+	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker transport_ready komafd=%d transport=%p", komafd, st)
+
+	ctx := transport.SetConnection(context.Background(), komaConn)
+	ctx = peer.NewContext(ctx, st.Peer())
+	for _, sh := range s.opts.statsHandlers {
+		sh.HandleConn(ctx, &stats.ConnEnd{})
+	}
+
+	defer func() {
+		st.Close(errors.New("finished serving streams for the server transport"))
+		for _, sh := range s.opts.statsHandlers {
+			sh.HandleConn(ctx, &stats.ConnEnd{})
+		}
+	}()
+
+	streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
+	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker entering_handle_streams komafd=%d", komafd)
+	st.HandleStreamsKoma(ctx, int(komafd), func(stream *transport.ServerStream) {
+		if stream == nil {
+			logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker dispatch_nil_stream komafd=%d", komafd)
+			return
+		}
+		logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker dispatch_stream komafd=%d stream_id=%d method=%q", komafd, stream.ID(), stream.Method())
+		s.dispatchKomaStream(streamQuota, st, stream)
+	})
+	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker handle_streams_done komafd=%d", komafd)
 }
 
 // NewServer creates a gRPC server which has no service registered and has not
@@ -817,6 +1046,7 @@ func NewServer(opt ...ServerOption) *Server {
 		done:     grpcsync.NewEvent(),
 		channelz: channelz.RegisterServer(""),
 	}
+	s.komaThreadingMode = s.opts.komaThreadingMode
 	chainUnaryServerInterceptors(s)
 	chainStreamServerInterceptors(s)
 	s.cv = sync.NewCond(&s.mu)
@@ -826,7 +1056,10 @@ func NewServer(opt ...ServerOption) *Server {
 	}
 
 	komaCfg, err := parseKomaConfig(
+		os.Getenv(grpcKomaEnabledEnvName),
 		os.Getenv(grpcKomaCoresEnvName),
+		os.Getenv(grpcKomaNumWorkersEnvName),
+		os.Getenv(grpcKomaThreadingModelEnvName),
 		os.Getenv(grpcKomaWorkersPerCoreEnvName),
 		os.Getenv(grpcKomaWorkerModeEnvName),
 		s.opts.numServerWorkers,
@@ -838,16 +1071,29 @@ func NewServer(opt ...ServerOption) *Server {
 		s.komaEnabled = true
 		s.komaCores = append(s.komaCores, komaCfg.cores...)
 		s.komaWorkerMode = komaCfg.workerMode
-		if s.opts.numServerWorkers == 0 || os.Getenv(grpcKomaWorkersPerCoreEnvName) != "" {
+		if os.Getenv(grpcKomaThreadingModelEnvName) != "" {
+			s.komaThreadingMode = komaCfg.threadingMode
+		}
+		if s.opts.numServerWorkers == 0 || os.Getenv(grpcKomaWorkersPerCoreEnvName) != "" || os.Getenv(grpcKomaNumWorkersEnvName) != "" {
 			s.opts.numServerWorkers = komaCfg.numWorkers
 		}
 	}
 
+	switch s.komaThreadingMode {
+	case KomaRTC, KomaAsym:
+	default:
+		logger.Fatalf("grpc: invalid Koma threading mode %q", s.komaThreadingMode)
+	}
+
 	if s.opts.numServerWorkers > 0 {
 		if !s.komaEnabled {
-			logger.Fatalf("grpc: numServerWorkers > 0 but %s is not set", grpcKomaCoresEnvName)
+			logger.Fatalf("grpc: numServerWorkers > 0 but %s is not set", grpcKomaEnabledEnvName)
 		}
-		s.initServerWorkers()
+		if s.komaThreadingMode == KomaAsym {
+			s.startKomaAsym()
+		} else {
+			s.initServerWorkers()
+		}
 	}
 
 	channelz.Info(logger, s.channelz, "Server created")
@@ -1232,7 +1478,7 @@ func (s *Server) newHTTP2Transport(c net.Conn, ifkoma bool) transport.ServerTran
 		HeaderTableSize:       s.opts.headerTableSize,
 		BufferPool:            s.opts.bufferPool,
 	}
-	st, err := transport.NewServerTransport(c, config, ifkoma)
+	st, err := transport.NewServerTransport(c, config, ifkoma, ifkoma && s.komaThreadingMode == KomaAsym)
 	//if ifkoma {
 	//fmt.Printf("create koma http transport %+v %v\n", st, err)
 	//}
@@ -2241,7 +2487,7 @@ func (s *Server) stop(graceful bool) {
 	}
 	s.conns = nil
 
-	if s.opts.numServerWorkers > 0 {
+	if s.serverWorkerChannelClose != nil {
 		// Closing the channel (only once, via sync.OnceFunc) after all the
 		// connections have been closed above ensures that there are no
 		// goroutines executing the callback passed to st.HandleStreams (where

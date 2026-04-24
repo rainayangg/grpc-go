@@ -46,7 +46,6 @@ import (
 	// "google.golang.org/grpc/timetrace"
 	"google.golang.org/protobuf/proto"
 
-	// "golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal/channelz"
@@ -68,6 +67,31 @@ var (
 	// than the limit set by peer.
 	ErrHeaderListSizeLimitViolation = status.Error(codes.Internal, "transport: trying to send header list size larger than the limit set by peer")
 )
+
+type komaTxKind int
+
+const (
+	komaTxWriteHeader komaTxKind = iota
+	komaTxWriteData
+	komaTxWriteStatus
+	komaTxCleanup
+	komaTxEarlyAbort
+)
+
+type komaTxOp struct {
+	kind        komaTxKind
+	stream      *ServerStream
+	streamID    uint32
+	md          metadata.MD
+	hdr         []byte
+	data        mem.BufferSlice
+	opts        *WriteOptions
+	status      *status.Status
+	rstCode     http2.ErrCode
+	earlyAbort  *earlyAbortStream
+	replyHandle uint64
+	done        chan error
+}
 
 // serverConnectionCounter counts the number of connections a server has seen
 // (equal to the number of http2Servers created). Must be accessed atomically.
@@ -140,6 +164,9 @@ type http2Server struct {
 	// copied here from loopyWriter
 	hBuf *bytes.Buffer  // The buffer for HPACK encoding.
 	hEnc *hpack.Encoder // HPACK encoder.
+
+	komaAsym  bool
+	komaTxOps chan *komaTxOp
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -149,7 +176,7 @@ type http2Server struct {
 // returns a nil transport and a non-nil error. For a special case where the
 // underlying conn gets closed before the client preface could be read, it
 // returns a nil transport and a nil error.
-func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ ServerTransport, err error) {
+func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool, komaAsym bool) (_ ServerTransport, err error) {
 	var authInfo credentials.AuthInfo
 	rawConn := conn
 	if config.Credentials != nil {
@@ -284,6 +311,15 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		bufferPool:        config.BufferPool,
 		hBuf:              &buf,
 		hEnc:              hpack.NewEncoder(&buf),
+		komaAsym:          komaAsym,
+	}
+	if ifkoma {
+		t.controlBuf = newControlBuffer(t.done)
+		close(t.loopyWriterDone)
+		if komaAsym {
+			t.komaTxOps = make(chan *komaTxOp, 128)
+			go t.komaTxWorker()
+		}
 	}
 	var czSecurity credentials.ChannelzSecurityValue
 	if au, ok := authInfo.(credentials.ChannelzSecurityInfo); ok {
@@ -367,7 +403,19 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 }
 
 // handle earlyabortstreams, adapted from func (l *loopyWriter) earlyAbortStreamHandler(eas *earlyAbortStream)
-func (t *http2Server) processEarlyAbortStream(eas *earlyAbortStream) error {
+func (t *http2Server) processEarlyAbortStream(eas *earlyAbortStream, replyHandle uint64) error {
+	if t.komaAsym {
+		copyEAS := *eas
+		return t.queueKomaTx(&komaTxOp{
+			kind:        komaTxEarlyAbort,
+			earlyAbort:  &copyEAS,
+			replyHandle: replyHandle,
+		})
+	}
+	return t.processEarlyAbortStreamDirect(eas, replyHandle)
+}
+
+func (t *http2Server) processEarlyAbortStreamDirect(eas *earlyAbortStream, replyHandle uint64) error {
 	// In case the caller forgets to set the http status, default to 200.
 	if eas.httpStatus == 0 {
 		eas.httpStatus = 200
@@ -386,29 +434,43 @@ func (t *http2Server) processEarlyAbortStream(eas *earlyAbortStream) error {
 		onWrite:   nil,
 	}
 
-	if err := t.processHeaderFrame(eas.streamID, h); err != nil {
+	if err := t.processHeaderFrame(eas.streamID, h, replyHandle, !eas.rst); err != nil {
 		return err
 	}
 	if eas.rst {
-		if err := t.framer.komafr.WriteRSTStream(eas.streamID, http2.ErrCodeNo); err != nil {
+		t.setKomaReplyCookie(replyHandle, http2.KomaReplyCookieFlagFinal)
+		if err := t.framer.komaWriter().WriteRSTStream(eas.streamID, http2.ErrCodeNo); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (t *http2Server) processCleanupStream(streamID uint32, rstCode http2.ErrCode) error {
-	return t.framer.komafr.WriteRSTStream(streamID, rstCode)
+func (t *http2Server) processCleanupStream(streamID uint32, rstCode http2.ErrCode, replyHandle uint64) error {
+	if t.komaAsym {
+		return t.queueKomaTx(&komaTxOp{
+			kind:        komaTxCleanup,
+			streamID:    streamID,
+			rstCode:     rstCode,
+			replyHandle: replyHandle,
+		})
+	}
+	return t.processCleanupStreamDirect(streamID, rstCode, replyHandle)
+}
+
+func (t *http2Server) processCleanupStreamDirect(streamID uint32, rstCode http2.ErrCode, replyHandle uint64) error {
+	t.setKomaReplyCookie(replyHandle, http2.KomaReplyCookieFlagFinal)
+	return t.framer.komaWriter().WriteRSTStream(streamID, rstCode)
 }
 
 // operateHeadersKoma takes action on the decoded headers. Returns an error if fatal
 // error encountered and transport needs to close, otherwise returns nil.
-func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame) (*ServerStream, error) {
+func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame, replyHandle uint64) (*ServerStream, error) {
 	streamID := frame.Header().StreamID
 	t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma start stream_id=%d truncated=%v fields=%d end_stream=%v header_len=%d", streamID, frame.Truncated, len(frame.Fields), frame.StreamEnded(), frame.Header().Length)
 	if frame.Truncated {
 		t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma truncated stream_id=%d", streamID)
-		t.processCleanupStream(streamID, http2.ErrCodeFrameSize)
+		t.processCleanupStream(streamID, http2.ErrCodeFrameSize, replyHandle)
 		return nil, nil
 	}
 	buf := newRecvBuffer()
@@ -420,6 +482,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		},
 		st:               t,
 		headerWireLength: int(frame.Header().Length),
+		KomaReplyHandle:  replyHandle,
 	}
 	var (
 		// if false, content-type was missing or invalid
@@ -476,7 +539,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 
 	if protocolError {
 		t.logger.Infof("DELETEME: (http2Server) (rx) operateHeadersKoma protocol_error stream_id=%d", streamID)
-		t.processCleanupStream(streamID, http2.ErrCodeProtocol)
+		t.processCleanupStream(streamID, http2.ErrCodeProtocol, replyHandle)
 		return s, nil
 	}
 	if !isGRPC {
@@ -488,7 +551,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			status:         status.Newf(codes.InvalidArgument, "invalid gRPC request content-type %q", contentType),
 			rst:            !frame.StreamEnded(),
 		}
-		t.processEarlyAbortStream(eas)
+		t.processEarlyAbortStream(eas, replyHandle)
 		return s, nil
 	}
 	if headerError != nil {
@@ -500,7 +563,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			status:         headerError,
 			rst:            !frame.StreamEnded(),
 		}
-		t.processEarlyAbortStream(eas)
+		t.processEarlyAbortStream(eas, replyHandle)
 		return s, nil
 	}
 
@@ -530,7 +593,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 			status:         status.New(codes.Internal, errMsg),
 			rst:            !frame.StreamEnded(),
 		}
-		t.processEarlyAbortStream(eas)
+		t.processEarlyAbortStream(eas, replyHandle)
 		s.cancel()
 		return s, nil
 	}
@@ -671,7 +734,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			status:         status.New(codes.Internal, errMsg),
 			rst:            !frame.StreamEnded(),
 		}
-		t.processEarlyAbortStream(eas)
+		t.processEarlyAbortStream(eas, 0)
 		return s, nil
 	}
 
@@ -692,7 +755,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			status:         status.Newf(codes.InvalidArgument, "invalid gRPC request content-type %q", contentType),
 			rst:            !frame.StreamEnded(),
 		}
-		t.processEarlyAbortStream(eas)
+		t.processEarlyAbortStream(eas, 0)
 		return s, nil
 	}
 	if headerError != nil {
@@ -703,7 +766,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			status:         headerError,
 			rst:            !frame.StreamEnded(),
 		}
-		t.processEarlyAbortStream(eas)
+		t.processEarlyAbortStream(eas, 0)
 		return s, nil
 	}
 
@@ -764,7 +827,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			status:         status.New(codes.Internal, errMsg),
 			rst:            !frame.StreamEnded(),
 		}
-		t.processEarlyAbortStream(eas)
+		t.processEarlyAbortStream(eas, 0)
 		s.cancel()
 		return s, nil
 	}
@@ -910,40 +973,19 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 	t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma start komafd=%d", komafd)
 	defer func() {
 		close(t.readerDone)
-		<-t.loopyWriterDone
 	}()
 
-	// --- epoll setup (manual polling, no GO netpoll) ---
-	// epfd, err := unix.EpollCreate1(0)
-	// if err != nil {
-	// 	fmt.Printf("EpollCreate1 error: %v\n", err)
-	// 	return
-	// }
-	// defer unix.Close(epfd)
-
-	// ev := &unix.EpollEvent{
-	// 	Events: unix.EPOLLIN,
-	// 	Fd:     int32(komafd),
-	// }
-
-	// if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, komafd, ev); err != nil {
-	// 	t.Close(fmt.Errorf("epoll ctl add komafd=%d: %w", komafd, err))
-	// 	return
-	// }
-	// events := make([]unix.EpollEvent, 64)
-
-	koma.KomaPull(komafd)
+	reader := t.framer.komaReader()
 	for {
-		// _, err := unix.EpollWait(epfd, events, -1)
-		// if err == unix.EINTR {
-		// 	continue
-		// }
-		// if err != nil {
-		// 	t.Close(fmt.Errorf("epoll wait %w", err))
-		// 	return
-		// }
+		select {
+		case <-t.done:
+			return
+		default:
+		}
 
-		frames, err := t.framer.komafr.ReadFrames()
+		koma.KomaPull(komafd)
+		frames, err := reader.ReadFrames()
+		replyCookie := reader.LastReplyCookie()
 		t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma read_frames komafd=%d frames=%d err=%v", komafd, len(frames), err)
 		// timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
 		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
@@ -955,13 +997,21 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			continue
 		}
 
+		batchInfo := analyzeKomaBatch(frames)
+		if batchInfo.uniqueStreamIDs > 1 || batchInfo.metaHeaders > 1 {
+			t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma mixed_batch komafd=%d unique_stream_ids=%d meta_headers=%d reply_handle=%d", komafd, batchInfo.uniqueStreamIDs, batchInfo.metaHeaders, replyCookie.Handle)
+		}
+
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 
 		if err != nil {
 			if _, ok := err.(http2.StreamError); ok {
 				t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma stream_error stream_id=%d code=%v frames=%d", frames[0].Header().StreamID, err.(http2.StreamError).Code, len(frames))
 				fmt.Printf("Write RST stream for %d", frames[0].Header().StreamID)
-				t.framer.komafr.WriteRSTStream(frames[0].Header().StreamID, err.(http2.StreamError).Code)
+				if txErr := t.processCleanupStream(frames[0].Header().StreamID, err.(http2.StreamError).Code, replyCookie.Handle); txErr != nil {
+					t.Close(txErr)
+					return
+				}
 				continue
 			}
 			t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma fatal_read_error komafd=%d frames=%d err=%v", komafd, len(frames), err)
@@ -977,7 +1027,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			case *http2.MetaHeadersFrame:
 				ifNewStream = true
 				t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma meta_headers stream_id=%d fields=%d end_stream=%v truncated=%v", frame.Header().StreamID, len(frame.Fields), frame.StreamEnded(), frame.Truncated)
-				s, err := t.operateHeadersKoma(ctx, frame)
+				s, err := t.operateHeadersKoma(ctx, frame, replyCookie.Handle)
 				if err != nil {
 					t.logger.Infof("DELETEME: (http2Server) (rx) HandleStreamsKoma operate_headers_error stream_id=%d err=%v", frame.Header().StreamID, err)
 					continue
@@ -1020,6 +1070,28 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		}
 
 	}
+}
+
+type komaBatchInfo struct {
+	uniqueStreamIDs int
+	metaHeaders     int
+	frameKinds      []string
+}
+
+func analyzeKomaBatch(frames []http2.Frame) komaBatchInfo {
+	streamIDs := make(map[uint32]struct{})
+	info := komaBatchInfo{
+		frameKinds: make([]string, 0, len(frames)),
+	}
+	for _, frame := range frames {
+		streamIDs[frame.Header().StreamID] = struct{}{}
+		if _, ok := frame.(*http2.MetaHeadersFrame); ok {
+			info.metaHeaders++
+		}
+		info.frameKinds = append(info.frameKinds, fmt.Sprintf("stream_id=%d frame_type=%T", frame.Header().StreamID, frame))
+	}
+	info.uniqueStreamIDs = len(streamIDs)
+	return info
 }
 
 func (t *http2Server) getStream(f http2.Frame) (*ServerStream, bool) {
@@ -1091,7 +1163,9 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 	t.logger.Infof("DELETEME: (http2Server) (rx) handleDataKoma start stream_id=%d size=%d data_len=%d end_stream=%v state=%v", s.id, size, len(f.Data()), f.StreamEnded(), s.getState())
 	if size > 0 {
 		if len(f.Data()) > 0 {
-			s.write(recvMsg{buffer: &mem.KomaBuffer{Data: f.Data()}})
+			// This is a copy. The RTC model had no copy since only one message was active at a time.
+			data := append([]byte(nil), f.Data()...)
+			s.write(recvMsg{buffer: &mem.KomaBuffer{Data: data}})
 		}
 	}
 	if f.StreamEnded() {
@@ -1099,6 +1173,75 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 		s.write(recvMsg{err: io.EOF})
 	}
 	t.logger.Infof("DELETEME: (http2Server) (rx) handleDataKoma done stream_id=%d end_stream=%v state=%v", s.id, f.StreamEnded(), s.getState())
+}
+
+func (t *http2Server) queueKomaTx(op *komaTxOp) error {
+	if !t.komaAsym {
+		return errors.New("queueKomaTx called when Koma asymmetric mode is disabled")
+	}
+	op.done = make(chan error, 1)
+	select {
+	case <-t.done:
+		return ErrConnClosing
+	case t.komaTxOps <- op:
+	}
+
+	select {
+	case err := <-op.done:
+		return err
+	case <-t.done:
+		return ErrConnClosing
+	}
+}
+
+func (t *http2Server) komaTxWorker() {
+	for {
+		select {
+		case <-t.done:
+			return
+		case op := <-t.komaTxOps:
+			if op == nil {
+				continue
+			}
+			err := t.executeKomaTx(op)
+			op.done <- err
+			close(op.done)
+		}
+	}
+}
+
+func (t *http2Server) setKomaReplyCookie(handle uint64, flags uint32) {
+	if t == nil || t.framer == nil || t.framer.komaWriter() == nil || handle == 0 {
+		return
+	}
+	t.framer.komaWriter().SetReplyCookie(http2.KomaReplyCookie{
+		Handle: handle,
+		Flags:  flags,
+	})
+}
+
+func (t *http2Server) setKomaReplyCookieForStream(s *ServerStream, flags uint32) {
+	if s == nil {
+		return
+	}
+	t.setKomaReplyCookie(s.KomaReplyHandle, flags)
+}
+
+func (t *http2Server) executeKomaTx(op *komaTxOp) error {
+	switch op.kind {
+	case komaTxWriteHeader:
+		return t.writeHeaderDirect(op.stream, op.md)
+	case komaTxWriteData:
+		return t.writeDirect(op.stream, op.hdr, op.data, op.opts)
+	case komaTxWriteStatus:
+		return t.writeStatusDirect(op.stream, op.status)
+	case komaTxCleanup:
+		return t.processCleanupStreamDirect(op.streamID, op.rstCode, op.replyHandle)
+	case komaTxEarlyAbort:
+		return t.processEarlyAbortStreamDirect(op.earlyAbort, op.replyHandle)
+	default:
+		return fmt.Errorf("unknown Koma TX op kind %d", op.kind)
+	}
 }
 
 func (t *http2Server) handleData(f *http2.DataFrame) {
@@ -1311,6 +1454,17 @@ func (t *http2Server) streamContextErr(s *ServerStream) error {
 
 // WriteHeader sends the header metadata md back to the client.
 func (t *http2Server) writeHeader(s *ServerStream, md metadata.MD) error {
+	if t.komaAsym {
+		return t.queueKomaTx(&komaTxOp{
+			kind:   komaTxWriteHeader,
+			stream: s,
+			md:     md,
+		})
+	}
+	return t.writeHeaderDirect(s, md)
+}
+
+func (t *http2Server) writeHeaderDirect(s *ServerStream, md metadata.MD) error {
 	s.hdrMu.Lock()
 	defer s.hdrMu.Unlock()
 	if s.getState() == streamDone {
@@ -1346,7 +1500,7 @@ func (t *http2Server) setResetPingStrikes() {
 // Koma only; processing header frame and send them out later. Note that the
 // logic of the code is mainly adopted from func (l *loopyWriter) headerHandler(h *headerFrame)
 // in controlbuf.go
-func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error {
+func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame, replyHandle uint64, retireOnLastFrame bool) error {
 	// Case 1.A: Server is responding back with headers.
 	// Comment it here because its the same with the 1.B case.
 
@@ -1389,7 +1543,12 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error 
 		if first {
 			// fmt.Printf("processHeaderFrame: 1.1\n")
 			first = false
-			err = t.framer.komafr.WriteHeaders(http2.HeadersFrameParam{
+			var replyFlags uint32
+			if endHeaders && retireOnLastFrame {
+				replyFlags = http2.KomaReplyCookieFlagFinal
+			}
+			t.setKomaReplyCookie(replyHandle, replyFlags)
+			err = t.framer.komaWriter().WriteHeaders(http2.HeadersFrameParam{
 				StreamID:      streamId,
 				BlockFragment: t.hBuf.Next(size),
 				EndStream:     h.endStream,
@@ -1397,7 +1556,12 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error 
 			})
 		} else {
 			// fmt.Printf("processHeaderFrame: 1.2\n")
-			err = t.framer.komafr.WriteContinuation(
+			var replyFlags uint32
+			if endHeaders && retireOnLastFrame {
+				replyFlags = http2.KomaReplyCookieFlagFinal
+			}
+			t.setKomaReplyCookie(replyHandle, replyFlags)
+			err = t.framer.komaWriter().WriteContinuation(
 				streamId,
 				endHeaders,
 				t.hBuf.Next(size),
@@ -1411,7 +1575,7 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame) error 
 	// fmt.Printf("processHeaderFrame: 2\n")
 	if h.cleanup != nil && h.cleanup.rst { // If RST_STREAM needs to be sent.
 		// fmt.Printf("processHeaderFrame: 3\n")
-		if err := t.processCleanupStream(h.cleanup.streamID, h.cleanup.rstCode); err != nil {
+		if err := t.processCleanupStreamDirect(h.cleanup.streamID, h.cleanup.rstCode, replyHandle); err != nil {
 			return err
 		}
 	}
@@ -1438,7 +1602,7 @@ func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 	}
 	// fmt.Printf("writeHeaderLocked: 1\n")
 	// success, err := t.controlBuf.executeAndPut(func() bool { return t.checkForHeaderListSize(hf) }, hf)
-	err := t.processHeaderFrame(s.id, hf)
+	err := t.processHeaderFrame(s.id, hf, s.KomaReplyHandle, false)
 	if err != nil {
 		fmt.Printf("writeHeaderLocked: processHeaderFrame error: %v\n", err)
 		return err
@@ -1460,6 +1624,17 @@ func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 // TODO(zhaoq): Now it indicates the end of entire stream. Revisit if early
 // OK is adopted.
 func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
+	if t.komaAsym {
+		return t.queueKomaTx(&komaTxOp{
+			kind:   komaTxWriteStatus,
+			stream: s,
+			status: st,
+		})
+	}
+	return t.writeStatusDirect(s, st)
+}
+
+func (t *http2Server) writeStatusDirect(s *ServerStream, st *status.Status) error {
 	s.hdrMu.Lock()
 	defer s.hdrMu.Unlock()
 
@@ -1505,12 +1680,11 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 		endStream: true,
 		onWrite:   t.setResetPingStrikes,
 	}
-
 	// success, err := t.controlBuf.executeAndPut(func() bool {
 	// 	return t.checkForHeaderListSize(trailingHeader)
 	// }, nil)
 
-	err := t.processHeaderFrame(s.id, trailingHeader)
+	err := t.processHeaderFrame(s.id, trailingHeader, s.KomaReplyHandle, true)
 	// fmt.Printf("http2_server.go: writeStatus: processHeaderFrame returned err %v\n", err)
 	if err != nil {
 		t.logger.Infof("DELETEME: (http2Server) (tx) writeStatus error stream_id=%d code=%s err=%v", s.id, st.Code().String(), err)
@@ -1532,7 +1706,21 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 
 // Write converts the data into HTTP2 data frame and sends it out. Non-nil error
 // is returns if it fails (e.g., framing error, transport error).
-func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
+func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
+	if t.komaAsym {
+		hdrCopy := append([]byte(nil), hdr...)
+		return t.queueKomaTx(&komaTxOp{
+			kind:   komaTxWriteData,
+			stream: s,
+			hdr:    hdrCopy,
+			data:   data,
+			opts:   opts,
+		})
+	}
+	return t.writeDirect(s, hdr, data, opts)
+}
+
+func (t *http2Server) writeDirect(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
 	// fmt.Printf("Write:0\n")
 	t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write start stream_id=%d hdr_len=%d data_buffers=%d header_sent=%v state=%v", s.id, len(hdr), len(data), s.isHeaderSent(), s.getState())
 	reader := data.Reader()
@@ -1541,7 +1729,7 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 	if !s.isHeaderSent() { // Headers haven't been written yet.
 		// fmt.Printf("!s.isHeaderSent()\n")
 		t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_header_before_data stream_id=%d", s.id)
-		if err := t.writeHeader(s, nil); err != nil {
+		if err := t.writeHeaderDirect(s, nil); err != nil {
 			t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_header_error stream_id=%d err=%v", s.id, err)
 			_ = reader.Close()
 			return err
@@ -1580,7 +1768,12 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 		t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write empty_data_frame stream_id=%d end_stream=%v", df.streamID, df.endStream)
 		// Empty data Frame
 		// Client sends out empty data frame with endStream = true
-		if err := t.framer.komafr.WriteData(df.streamID, df.endStream, nil); err != nil {
+		var replyFlags uint32
+		if df.endStream {
+			replyFlags = http2.KomaReplyCookieFlagFinal
+		}
+		t.setKomaReplyCookieForStream(s, replyFlags)
+		if err := t.framer.komaWriter().WriteData(df.streamID, df.endStream, nil); err != nil {
 			t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_data_error stream_id=%d empty=true err=%v", df.streamID, err)
 			return err
 		}
@@ -1609,7 +1802,8 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 	}
 	// fmt.Printf("http2_server.go: write: write data frame of size %d (header %d + data %d) on stream %d\n", hSize+dSize, hSize, dSize, df.streamID)
 	t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_data_start stream_id=%d frame_payload_len=%d end_stream=%v", df.streamID, hSize+dSize, df.endStream)
-	if err := t.framer.komafr.WriteData(df.streamID, df.endStream, (*buf)[:hSize+dSize]); err != nil {
+	t.setKomaReplyCookieForStream(s, 0)
+	if err := t.framer.komaWriter().WriteData(df.streamID, df.endStream, (*buf)[:hSize+dSize]); err != nil {
 		t.logger.Infof("DELETEME: (http2Server) (tx) http2Server.write write_data_error stream_id=%d empty=false err=%v", df.streamID, err)
 		return err
 	}
@@ -1732,8 +1926,24 @@ func (t *http2Server) Close(err error) {
 	streams := t.activeStreams
 	t.activeStreams = nil
 	t.mu.Unlock()
-	t.controlBuf.finish()
 	close(t.done)
+	if t.controlBuf != nil {
+		t.controlBuf.finish()
+	}
+	if t.komaTxOps != nil {
+		for {
+			select {
+			case op := <-t.komaTxOps:
+				if op != nil && op.done != nil {
+					op.done <- ErrConnClosing
+					close(op.done)
+				}
+			default:
+				goto drained
+			}
+		}
+	}
+drained:
 	if err := t.conn.Close(); err != nil && t.logger.V(logLevel) {
 		t.logger.Infof("Error closing underlying net.Conn during Close: %v", err)
 	}
@@ -1787,7 +1997,7 @@ func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrC
 	}
 	// t.controlBuf.put(hdr)
 	if rst {
-		t.processCleanupStream(s.id, rstCode)
+		t.processCleanupStream(s.id, rstCode, s.KomaReplyHandle)
 	}
 }
 

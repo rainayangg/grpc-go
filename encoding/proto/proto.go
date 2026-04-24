@@ -22,7 +22,6 @@ package proto
 
 import (
 	"fmt"
-	"strings"
 
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/mem"
@@ -40,14 +39,6 @@ func init() {
 // codec is a CodecV2 implementation with protobuf. It is the default codec for
 // gRPC.
 type codecV2 struct{}
-
-func deleteMeProtoTraceEnabled(v any, dataLen int) bool {
-	if dataLen < 8000 {
-		return false
-	}
-	typeName := fmt.Sprintf("%T", v)
-	return strings.Contains(typeName, "Profile") || strings.Contains(typeName, "GetProfiles")
-}
 
 func (c *codecV2) Marshal(v any) (data mem.BufferSlice, err error) {
 	vv := messageV2Of(v)
@@ -80,9 +71,6 @@ func (c *codecV2) Unmarshal(data mem.BufferSlice, v any) (err error) {
 	if vv == nil {
 		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
 	}
-	if deleteMeProtoTraceEnabled(v, data.Len()) {
-		fmt.Printf("DELETEME: proto codec unmarshal start msg_type=%T payload_len=%d\n", v, data.Len())
-	}
 
 	buf := data.MaterializeToBuffer(mem.DefaultBufferPool())
 	defer buf.Free()
@@ -90,9 +78,6 @@ func (c *codecV2) Unmarshal(data mem.BufferSlice, v any) (err error) {
 	//  really possible without a major overhaul of the proto package, but the
 	//  vtprotobuf library may be able to support this.
 	err = proto.Unmarshal(buf.ReadOnlyData(), vv)
-	if deleteMeProtoTraceEnabled(v, data.Len()) {
-		fmt.Printf("DELETEME: proto codec unmarshal done msg_type=%T payload_len=%d err=%v\n", v, data.Len(), err)
-	}
 	return err
 }
 
