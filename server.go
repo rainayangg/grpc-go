@@ -851,24 +851,18 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 		if err := PinThreadToCPU(cpuID); err != nil {
 			panic(err)
 		}
-		logger.Infof("DELETEME: (server) (rx) serverWorker pinned worker_id=%d cpu_id=%d mode=%q", workerID, cpuID, s.komaWorkerMode)
 	}
-	logger.Infof("DELETEME: (server) (rx) serverWorker start worker_id=%d cpu_id=%d mode=%q", workerID, cpuID, s.komaWorkerMode)
 
 	komafd := koma.KomaInit()
-	logger.Infof("DELETEME: (server) (rx) serverWorker koma_init worker_id=%d cpu_id=%d komafd=%d", workerID, cpuID, komafd)
 	// TODO(Rui): locking here for concurrent access to the shared list of all koma fds
 	s.mu.Lock()
 	s.komafds = append(s.komafds, komafd)
-	logger.Infof("DELETEME: (server) (rx) serverWorker registered_koma_fd worker_id=%d komafd=%d total_komafds=%d", workerID, komafd, len(s.komafds))
 	s.mu.Unlock()
 	komaConn, _ := http2.NewKomaConn(komafd)
-	logger.Infof("DELETEME: (server) (rx) serverWorker koma_conn_ready worker_id=%d komafd=%d conn=%p", workerID, komafd, komaConn)
 
 	// create a dedicated new transport for the koma connection, note that it is
 	// different from the serverTransport of a normal TCP connection
 	st := s.newHTTP2Transport(komaConn, true)
-	logger.Infof("DELETEME: (server) (rx) serverWorker transport_ready worker_id=%d komafd=%d transport=%p", workerID, komafd, st)
 
 	ctx := transport.SetConnection(context.Background(), komaConn)
 
@@ -886,13 +880,9 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 	}()
 
 	// streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
-	logger.Infof("DELETEME: (server) (rx) serverWorker entering_handle_streams worker_id=%d komafd=%d", workerID, komafd)
 	st.HandleStreamsKoma(ctx, int(komafd), func(stream *transport.ServerStream) {
-		logger.Infof("DELETEME: (server) (rx) serverWorker dispatch_stream worker_id=%d komafd=%d stream_id=%d method=%q", workerID, komafd, stream.ID(), stream.Method())
 		s.handleStream(st, stream)
-		logger.Infof("DELETEME: (server) (rx) serverWorker handled_stream worker_id=%d komafd=%d stream_id=%d method=%q", workerID, komafd, stream.ID(), stream.Method())
 	})
-	logger.Infof("DELETEME: (server) (rx) serverWorker handle_streams_done worker_id=%d komafd=%d", workerID, komafd)
 }
 
 func (s *Server) komaWorkerCPU(workerID int) int {
@@ -909,13 +899,10 @@ func (s *Server) handleStreamWorker(workerID int, cpuID int) {
 		if err := PinThreadToCPU(cpuID); err != nil {
 			panic(err)
 		}
-		logger.Infof("DELETEME: (server) (rx) handleStreamWorker pinned worker_id=%d cpu_id=%d mode=%q", workerID, cpuID, s.komaWorkerMode)
 	}
-	logger.Infof("DELETEME: (server) (rx) handleStreamWorker start worker_id=%d cpu_id=%d mode=%q", workerID, cpuID, s.komaWorkerMode)
 	for completed := 0; completed < serverWorkerResetThreshold; completed++ {
 		f, ok := <-s.serverWorkerChannel
 		if !ok {
-			logger.Infof("DELETEME: (server) (rx) handleStreamWorker stop worker_id=%d cpu_id=%d", workerID, cpuID)
 			return
 		}
 		f()
@@ -976,30 +963,23 @@ func (s *Server) komaAsymIOWorker() {
 		if err := PinThreadToCPU(ioCPU); err != nil {
 			panic(err)
 		}
-		logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker pinned cpu_id=%d mode=%q", ioCPU, s.komaWorkerMode)
 	}
-	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker start cpu_id=%d mode=%q", ioCPU, s.komaWorkerMode)
 
 	komafd := koma.KomaInit()
-	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker koma_init cpu_id=%d komafd=%d", ioCPU, komafd)
 
 	s.mu.Lock()
 	s.komafds = append(s.komafds, komafd)
-	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker registered_koma_fd komafd=%d total_komafds=%d", komafd, len(s.komafds))
 	s.mu.Unlock()
 
 	komaConn, err := http2.NewKomaConn(komafd)
 	if err != nil {
 		panic(err)
 	}
-	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker koma_conn_ready komafd=%d conn=%p", komafd, komaConn)
 	if err := komaConn.SetRequireReplyCookie(true); err != nil {
 		panic(err)
 	}
-	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker require_reply_cookie_enabled komafd=%d", komafd)
 
 	st := s.newHTTP2Transport(komaConn, true)
-	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker transport_ready komafd=%d transport=%p", komafd, st)
 
 	ctx := transport.SetConnection(context.Background(), komaConn)
 	ctx = peer.NewContext(ctx, st.Peer())
@@ -1015,16 +995,12 @@ func (s *Server) komaAsymIOWorker() {
 	}()
 
 	streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
-	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker entering_handle_streams komafd=%d", komafd)
 	st.HandleStreamsKoma(ctx, int(komafd), func(stream *transport.ServerStream) {
 		if stream == nil {
-			logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker dispatch_nil_stream komafd=%d", komafd)
 			return
 		}
-		logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker dispatch_stream komafd=%d stream_id=%d method=%q", komafd, stream.ID(), stream.Method())
 		s.dispatchKomaStream(streamQuota, st, stream)
 	})
-	logger.Infof("DELETEME: (server) (rx) komaAsymIOWorker handle_streams_done komafd=%d", komafd)
 }
 
 // NewServer creates a gRPC server which has no service registered and has not
@@ -1647,24 +1623,19 @@ func (s *Server) incrCallsFailed() {
 
 func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStream, msg any, cp Compressor, opts *transport.WriteOptions, comp encoding.Compressor) error {
 	// fmt.Printf("Server: sendResponse called\n")
-	logger.Infof("DELETEME: (server) (tx) sendResponse start stream_id=%d method=%q msg_type=%T last=%v", stream.ID(), stream.Method(), msg, opts != nil && opts.Last)
 	data, err := encode(s.getCodec(stream.ContentSubtype()), msg)
 	if err != nil {
-		logger.Infof("DELETEME: (server) (tx) sendResponse encode_error stream_id=%d err=%v", stream.ID(), err)
 		channelz.Error(logger, s.channelz, "grpc: server failed to encode response: ", err)
 		return err
 	}
-	logger.Infof("DELETEME: (server) (tx) sendResponse encode_ok stream_id=%d data_len=%d content_subtype=%q", stream.ID(), data.Len(), stream.ContentSubtype())
 
 	// fmt.Printf("Server: sendResponse encoded data.Len=%d\n", data.Len())
 	compData, pf, err := compress(data, cp, comp, s.opts.bufferPool)
 	if err != nil {
-		logger.Infof("DELETEME: (server) (tx) sendResponse compress_error stream_id=%d err=%v", stream.ID(), err)
 		data.Free()
 		channelz.Error(logger, s.channelz, "grpc: server failed to compress response: ", err)
 		return err
 	}
-	logger.Infof("DELETEME: (server) (tx) sendResponse compress_ok stream_id=%d compressed_len=%d payload_format=%v send_compress=%q", stream.ID(), compData.Len(), pf, stream.SendCompress())
 
 	hdr, payload := msgHeader(data, compData, pf)
 
@@ -1679,13 +1650,10 @@ func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStrea
 	payloadLen := payload.Len()
 	// TODO(dfawley): should we be checking len(data) instead?
 	if payloadLen > s.opts.maxSendMessageSize {
-		logger.Infof("DELETEME: (server) (tx) sendResponse payload_too_large stream_id=%d payload_len=%d max_send=%d", stream.ID(), payloadLen, s.opts.maxSendMessageSize)
 		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", payloadLen, s.opts.maxSendMessageSize)
 	}
 	// fmt.Printf("Server: sendResponse payloadLen=%d\n", payloadLen)
-	logger.Infof("DELETEME: (server) (tx) sendResponse write_start stream_id=%d hdr_len=%d data_len=%d payload_len=%d", stream.ID(), len(hdr), dataLen, payloadLen)
 	err = stream.Write(hdr, payload, opts)
-	logger.Infof("DELETEME: (server) (tx) sendResponse write_done stream_id=%d err=%v", stream.ID(), err)
 	if err == nil {
 		if len(s.opts.statsHandlers) != 0 {
 			for _, sh := range s.opts.statsHandlers {
@@ -1733,7 +1701,6 @@ func getChainUnaryHandler(interceptors []UnaryServerInterceptor, curr int, info 
 }
 
 func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerStream, info *serviceInfo, md *MethodDesc, trInfo *traceInfo) (err error) {
-	logger.Infof("DELETEME: (server) (rx) processUnaryRPC start stream_id=%d method=%q", stream.ID(), stream.Method())
 	shs := s.opts.statsHandlers
 	if len(shs) != 0 || trInfo != nil || channelz.IsOn() {
 		if channelz.IsOn() {
@@ -1876,14 +1843,11 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 	// timetrace.Record1("%d recvAndDecompress", stream.Mark)
 	d, err := recvAndDecompress(&parser{r: stream, bufferPool: s.opts.bufferPool}, stream, dc, s.opts.maxReceiveMessageSize, payInfo, decomp, true)
 	if err != nil {
-		logger.Infof("DELETEME: (server) (rx) processUnaryRPC recv_error stream_id=%d err=%v", stream.ID(), err)
 		if e := stream.WriteStatus(status.Convert(err)); e != nil {
-			logger.Infof("DELETEME: (server) (tx) processUnaryRPC write_status_error stream_id=%d phase=%q err=%v", stream.ID(), "recv_error", e)
 			channelz.Warningf(logger, s.channelz, "grpc: Server.processUnaryRPC failed to write status: %v", e)
 		}
 		return err
 	}
-	logger.Infof("DELETEME: (server) (rx) processUnaryRPC recv_ok stream_id=%d payload_len=%d recv_compress=%q", stream.ID(), d.Len(), stream.RecvCompress())
 	freed := false
 	dataFree := func() {
 		if !freed {
@@ -1918,11 +1882,9 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 		if trInfo != nil {
 			trInfo.tr.LazyLog(&payload{sent: false, msg: v}, true)
 		}
-		logger.Infof("DELETEME: (server) (rx) processUnaryRPC decoded_request stream_id=%d request_type=%T payload_len=%d", stream.ID(), v, d.Len())
 		return nil
 	}
 	ctx = NewContextWithServerTransportStream(ctx, stream)
-	logger.Infof("DELETEME: (server) (rx) processUnaryRPC invoke_handler stream_id=%d method=%q", stream.ID(), stream.Method())
 	reply, appErr := md.Handler(info.serviceImpl, ctx, df, s.opts.unaryInt)
 	if appErr != nil {
 		appStatus, ok := status.FromError(appErr)
@@ -1936,9 +1898,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 			trInfo.tr.LazyLog(stringer(appStatus.Message()), true)
 			trInfo.tr.SetError()
 		}
-		logger.Infof("DELETEME: (server) (tx) processUnaryRPC handler_error stream_id=%d code=%s message=%q err=%v", stream.ID(), appStatus.Code().String(), appStatus.Message(), appErr)
 		if e := stream.WriteStatus(appStatus); e != nil {
-			logger.Infof("DELETEME: (server) (tx) processUnaryRPC write_status_error stream_id=%d phase=%q err=%v", stream.ID(), "handler_error", e)
 			channelz.Warningf(logger, s.channelz, "grpc: Server.processUnaryRPC failed to write status: %v", e)
 		}
 		if len(binlogs) != 0 {
@@ -1965,7 +1925,6 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 	if trInfo != nil {
 		trInfo.tr.LazyLog(stringer("OK"), false)
 	}
-	logger.Infof("DELETEME: (server) (tx) processUnaryRPC handler_ok stream_id=%d reply_type=%T send_compress=%q", stream.ID(), reply, stream.SendCompress())
 	opts := &transport.WriteOptions{Last: true}
 
 	// Server handler could have set new compressor by calling SetSendCompressor.
@@ -1976,16 +1935,13 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 
 	// timetrace.Record1("%d to send response", stream.Mark)
 	// fmt.Printf("%d to send response", stream.Mark)
-	logger.Infof("DELETEME: (server) (tx) processUnaryRPC send_response_start stream_id=%d method=%q", stream.ID(), stream.Method())
 	if err := s.sendResponse(ctx, stream, reply, cp, opts, comp); err != nil {
-		logger.Infof("DELETEME: (server) (tx) processUnaryRPC send_response_error stream_id=%d err=%v", stream.ID(), err)
 		if err == io.EOF {
 			// The entire stream is done (for unary RPC only).
 			return err
 		}
 		if sts, ok := status.FromError(err); ok {
 			if e := stream.WriteStatus(sts); e != nil {
-				logger.Infof("DELETEME: (server) (tx) processUnaryRPC write_status_error stream_id=%d phase=%q err=%v", stream.ID(), "send_response_error", e)
 				channelz.Warningf(logger, s.channelz, "grpc: Server.processUnaryRPC failed to write status: %v", e)
 			}
 		} else {
@@ -2012,7 +1968,6 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 		}
 		return err
 	}
-	logger.Infof("DELETEME: (server) (tx) processUnaryRPC send_response_ok stream_id=%d reply_type=%T", stream.ID(), reply)
 	// timetrace.Record1("%d finish sending response", stream.Mark)
 	if len(binlogs) != 0 {
 		h, _ := stream.Header()
@@ -2043,9 +1998,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
 		}
 	}
 	// fmt.Printf("ProcessUnaryRPC: start WriteStatus\n")
-	logger.Infof("DELETEME: (server) (tx) processUnaryRPC write_status_ok_start stream_id=%d", stream.ID())
 	err = stream.WriteStatus(statusOK)
-	logger.Infof("DELETEME: (server) (tx) processUnaryRPC write_status_ok_done stream_id=%d err=%v", stream.ID(), err)
 	// fmt.Printf("ProcessUnaryRPC: finish WriteStatus\n")
 	return err
 }
@@ -2087,7 +2040,6 @@ func getChainStreamHandler(interceptors []StreamServerInterceptor, curr int, inf
 }
 
 func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.ServerStream, info *serviceInfo, sd *StreamDesc, trInfo *traceInfo) (err error) {
-	logger.Infof("DELETEME: (server) (rx) processStreamingRPC start stream_id=%d method=%q client_stream=%v server_stream=%v", stream.ID(), stream.Method(), sd.ClientStreams, sd.ServerStreams)
 	if channelz.IsOn() {
 		s.incrCallsStarted()
 	}
@@ -2229,7 +2181,6 @@ func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.Serv
 	if info != nil {
 		server = info.serviceImpl
 	}
-	logger.Infof("DELETEME: (server) (rx) processStreamingRPC invoke_handler stream_id=%d method=%q has_stream_interceptor=%v", stream.ID(), stream.Method(), s.opts.streamInt != nil)
 	if s.opts.streamInt == nil {
 		appErr = sd.Handler(server, ss)
 	} else {
@@ -2263,9 +2214,7 @@ func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.Serv
 				binlog.Log(ctx, st)
 			}
 		}
-		logger.Infof("DELETEME: (server) (tx) processStreamingRPC handler_error stream_id=%d code=%s message=%q err=%v", stream.ID(), appStatus.Code().String(), appStatus.Message(), appErr)
-		writeErr := ss.s.WriteStatus(appStatus)
-		logger.Infof("DELETEME: (server) (tx) processStreamingRPC write_status_done stream_id=%d code=%s err=%v", stream.ID(), appStatus.Code().String(), writeErr)
+		ss.s.WriteStatus(appStatus)
 		// TODO: Should we log an error from WriteStatus here and below?
 		return appErr
 	}
@@ -2283,16 +2232,13 @@ func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.Serv
 			binlog.Log(ctx, st)
 		}
 	}
-	logger.Infof("DELETEME: (server) (tx) processStreamingRPC handler_ok stream_id=%d method=%q", stream.ID(), stream.Method())
 	err = ss.s.WriteStatus(statusOK)
-	logger.Infof("DELETEME: (server) (tx) processStreamingRPC write_status_done stream_id=%d code=%s err=%v", stream.ID(), statusOK.Code().String(), err)
 	return err
 }
 
 func (s *Server) handleStream(t transport.ServerTransport, stream *transport.ServerStream) {
 	ctx := stream.Context()
 	ctx = contextWithServer(ctx, s)
-	logger.Infof("DELETEME: (server) (rx) handleStream start stream_id=%d method=%q peer=%v", stream.ID(), stream.Method(), t.Peer().Addr)
 	var ti *traceInfo
 	if EnableTracing {
 		tr := newTrace("grpc.Recv."+methodFamily(stream.Method()), stream.Method())
@@ -2315,14 +2261,12 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Ser
 	}
 	pos := strings.LastIndex(sm, "/")
 	if pos == -1 {
-		logger.Infof("DELETEME: (server) (rx) handleStream malformed_method stream_id=%d raw_method=%q", stream.ID(), stream.Method())
 		if ti != nil {
 			ti.tr.LazyLog(&fmtStringer{"Malformed method name %q", []any{sm}}, true)
 			ti.tr.SetError()
 		}
 		errDesc := fmt.Sprintf("malformed method name: %q", stream.Method())
 		if err := stream.WriteStatus(status.New(codes.Unimplemented, errDesc)); err != nil {
-			logger.Infof("DELETEME: (server) (tx) handleStream write_status_error stream_id=%d code=%s desc=%q err=%v", stream.ID(), codes.Unimplemented.String(), errDesc, err)
 			if ti != nil {
 				ti.tr.LazyLog(&fmtStringer{"%v", []any{err}}, true)
 				ti.tr.SetError()
@@ -2336,7 +2280,6 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Ser
 	}
 	service := sm[:pos]
 	method := sm[pos+1:]
-	logger.Infof("DELETEME: (server) (rx) handleStream parsed stream_id=%d service=%q method=%q", stream.ID(), service, method)
 
 	// FromIncomingContext is expensive: skip if there are no statsHandlers
 	if len(s.opts.statsHandlers) > 0 {
@@ -2360,19 +2303,16 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Ser
 	srv, knownService := s.services[service]
 	if knownService {
 		if md, ok := srv.methods[method]; ok {
-			logger.Infof("DELETEME: (server) (rx) handleStream dispatch_unary stream_id=%d full_method=%q", stream.ID(), stream.Method())
 			s.processUnaryRPC(ctx, stream, srv, md, ti)
 			return
 		}
 		if sd, ok := srv.streams[method]; ok {
-			logger.Infof("DELETEME: (server) (rx) handleStream dispatch_streaming stream_id=%d full_method=%q", stream.ID(), stream.Method())
 			s.processStreamingRPC(ctx, stream, srv, sd, ti)
 			return
 		}
 	}
 	// Unknown service, or known server unknown method.
 	if unknownDesc := s.opts.unknownStreamDesc; unknownDesc != nil {
-		logger.Infof("DELETEME: (server) (rx) handleStream dispatch_unknown_stream_desc stream_id=%d full_method=%q known_service=%v", stream.ID(), stream.Method(), knownService)
 		s.processStreamingRPC(ctx, stream, nil, unknownDesc, ti)
 		return
 	}
@@ -2382,13 +2322,11 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Ser
 	} else {
 		errDesc = fmt.Sprintf("unknown method %v for service %v", method, service)
 	}
-	logger.Infof("DELETEME: (server) (tx) handleStream unimplemented stream_id=%d full_method=%q known_service=%v desc=%q", stream.ID(), stream.Method(), knownService, errDesc)
 	if ti != nil {
 		ti.tr.LazyPrintf("%s", errDesc)
 		ti.tr.SetError()
 	}
 	if err := stream.WriteStatus(status.New(codes.Unimplemented, errDesc)); err != nil {
-		logger.Infof("DELETEME: (server) (tx) handleStream write_status_error stream_id=%d code=%s desc=%q err=%v", stream.ID(), codes.Unimplemented.String(), errDesc, err)
 		if ti != nil {
 			ti.tr.LazyLog(&fmtStringer{"%v", []any{err}}, true)
 			ti.tr.SetError()

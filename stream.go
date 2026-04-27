@@ -1110,15 +1110,8 @@ func (a *csAttempt) sendMsg(m any, hdr []byte, payld mem.BufferSlice, dataLength
 	return nil
 }
 
-func deleteMeClientTraceEnabled(method string) bool {
-	return method == "/profile.Profile/GetProfiles"
-}
-
 func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 	cs := a.cs
-	method := a.transportStream.Method()
-	streamID := a.transportStream.ID()
-	traceEnabled := deleteMeClientTraceEnabled(method)
 	if len(a.statsHandlers) != 0 && payInfo == nil {
 		payInfo = &payloadInfo{}
 		defer payInfo.free()
@@ -1140,36 +1133,15 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
 		// Only initialize this state once per stream.
 		a.decompressorSet = true
 	}
-	if traceEnabled {
-		logger.Infof("DELETEME: client recvMsg start stream_id=%d method=%q msg_type=%T recv_compress=%q", streamID, method, m, a.transportStream.RecvCompress())
-	}
 	if err := recv(a.parser, cs.codec, a.transportStream, a.decompressorV0, m, *cs.callInfo.maxReceiveMessageSize, payInfo, a.decompressorV1, false); err != nil {
-		if traceEnabled {
-			logger.Infof("DELETEME: client recvMsg recv_error stream_id=%d method=%q err=%v transport_status=%v trailer_keys=%d", streamID, method, err, a.transportStream.Status().Err(), len(a.transportStream.Trailer()))
-		}
 		if err == io.EOF {
 			if statusErr := a.transportStream.Status().Err(); statusErr != nil {
-				if traceEnabled {
-					logger.Infof("DELETEME: client recvMsg eof_with_status stream_id=%d method=%q status_err=%v", streamID, method, statusErr)
-				}
 				return statusErr
-			}
-			if traceEnabled {
-				logger.Infof("DELETEME: client recvMsg eof_ok stream_id=%d method=%q", streamID, method)
 			}
 			return io.EOF // indicates successful end of stream.
 		}
 
 		return toRPCErr(err)
-	}
-	if traceEnabled {
-		compressedLength := 0
-		uncompressedLength := 0
-		if payInfo != nil {
-			compressedLength = payInfo.compressedLength
-			uncompressedLength = payInfo.uncompressedBytes.Len()
-		}
-		logger.Infof("DELETEME: client recvMsg success stream_id=%d method=%q msg_type=%T compressed_len=%d uncompressed_len=%d", streamID, method, m, compressedLength, uncompressedLength)
 	}
 	if a.trInfo != nil {
 		a.mu.Lock()

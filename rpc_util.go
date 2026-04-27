@@ -847,25 +847,15 @@ func (p *payloadInfo) free() {
 // See: https://google.github.io/styleguide/go/best-practices.html#function-argument-lists
 func recvAndDecompress(p *parser, s recvCompressor, dc Decompressor, maxReceiveMessageSize int, payInfo *payloadInfo, compressor encoding.Compressor, isServer bool,
 ) (out mem.BufferSlice, err error) {
-	method, streamID, traceEnabled := deleteMeRecvTraceInfo(s)
 	pf, compressed, err := p.recvMsg(maxReceiveMessageSize)
 	if err != nil {
-		if traceEnabled {
-			fmt.Printf("DELETEME: recvAndDecompress recvMsg_error stream_id=%d method=%q err=%v\n", streamID, method, err)
-		}
 		return nil, err
 	}
 
 	compressedLength := compressed.Len()
-	if traceEnabled {
-		fmt.Printf("DELETEME: recvAndDecompress parsed stream_id=%d method=%q compressed_flag=%v compressed_len=%d recv_compress=%q\n", streamID, method, pf.isCompressed(), compressedLength, s.RecvCompress())
-	}
 
 	if st := checkRecvPayload(pf, s.RecvCompress(), compressor != nil || dc != nil, isServer); st != nil {
 		compressed.Free()
-		if traceEnabled {
-			fmt.Printf("DELETEME: recvAndDecompress payload_check_error stream_id=%d method=%q err=%v\n", streamID, method, st.Err())
-		}
 		return nil, st.Err()
 	}
 
@@ -875,9 +865,6 @@ func recvAndDecompress(p *parser, s recvCompressor, dc Decompressor, maxReceiveM
 		// use this decompressor as the default.
 		out, err = decompress(compressor, compressed, dc, maxReceiveMessageSize, p.bufferPool)
 		if err != nil {
-			if traceEnabled {
-				fmt.Printf("DELETEME: recvAndDecompress decompress_error stream_id=%d method=%q err=%v\n", streamID, method, err)
-			}
 			return nil, err
 		}
 	} else {
@@ -888,9 +875,6 @@ func recvAndDecompress(p *parser, s recvCompressor, dc Decompressor, maxReceiveM
 		payInfo.compressedLength = compressedLength
 		out.Ref()
 		payInfo.uncompressedBytes = out
-	}
-	if traceEnabled {
-		fmt.Printf("DELETEME: recvAndDecompress output stream_id=%d method=%q output_len=%d\n", streamID, method, out.Len())
 	}
 
 	return out, nil
@@ -942,29 +926,12 @@ type recvCompressor interface {
 	RecvCompress() string
 }
 
-func deleteMeRecvTraceInfo(s recvCompressor) (method string, streamID uint32, enabled bool) {
-	withMethod, ok := s.(interface{ Method() string })
-	if !ok {
-		return "", 0, false
-	}
-	method = withMethod.Method()
-	withID, ok := s.(interface{ ID() uint32 })
-	if ok {
-		streamID = withID.ID()
-	}
-	return method, streamID, deleteMeClientTraceEnabled(method)
-}
-
 // For the two compressor parameters, both should not be set, but if they are,
 // dc takes precedence over compressor.
 // TODO(dfawley): wrap the old compressor/decompressor using the new API?
 func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor, m any, maxReceiveMessageSize int, payInfo *payloadInfo, compressor encoding.Compressor, isServer bool) error {
-	method, streamID, traceEnabled := deleteMeRecvTraceInfo(s)
 	data, err := recvAndDecompress(p, s, dc, maxReceiveMessageSize, payInfo, compressor, isServer)
 	if err != nil {
-		if traceEnabled {
-			fmt.Printf("DELETEME: recv recvAndDecompress_error stream_id=%d method=%q err=%v\n", streamID, method, err)
-		}
 		return err
 	}
 
@@ -972,17 +939,8 @@ func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor, m any, maxR
 	// free the buffers.
 	defer data.Free()
 
-	if traceEnabled {
-		fmt.Printf("DELETEME: recv before_unmarshal stream_id=%d method=%q msg_type=%T payload_len=%d\n", streamID, method, m, data.Len())
-	}
 	if err := c.Unmarshal(data, m); err != nil {
-		if traceEnabled {
-			fmt.Printf("DELETEME: recv unmarshal_error stream_id=%d method=%q msg_type=%T payload_len=%d err=%v\n", streamID, method, m, data.Len(), err)
-		}
 		return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
-	}
-	if traceEnabled {
-		fmt.Printf("DELETEME: recv unmarshal_ok stream_id=%d method=%q msg_type=%T payload_len=%d\n", streamID, method, m, data.Len())
 	}
 
 	return nil

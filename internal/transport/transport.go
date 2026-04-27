@@ -62,13 +62,10 @@ type recvMsg struct {
 // interface. recvBuffer is written to much more often and using strict recvMsg
 // structs helps avoid allocation in "recvBuffer.put"
 type recvBuffer struct {
-	c             chan recvMsg
-	mu            sync.Mutex
-	backlog       []recvMsg
-	err           error
-	traceMethod   string
-	traceStreamID uint32
-	traceSeq      uint64
+	c       chan recvMsg
+	mu      sync.Mutex
+	backlog []recvMsg
+	err     error
 }
 
 func newRecvBuffer() *recvBuffer {
@@ -78,85 +75,44 @@ func newRecvBuffer() *recvBuffer {
 	return b
 }
 
-func (b *recvBuffer) deleteMeTraceSet(method string, streamID uint32) {
-	b.traceMethod = method
-	b.traceStreamID = streamID
-}
-
-func (b *recvBuffer) deleteMeTraceNextSeq() uint64 {
-	return atomic.AddUint64(&b.traceSeq, 1)
-}
-
 func (b *recvBuffer) put(r recvMsg) {
-	seq := b.deleteMeTraceNextSeq()
-	bufferLen := 0
-	if r.buffer != nil {
-		bufferLen = r.buffer.Len()
-	}
 	b.mu.Lock()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) put_start seq=%d recv=%p stream_id=%d method=%q backlog_len=%d existing_err=%v incoming_err=%v incoming_buf_len=%d\n", seq, b, b.traceStreamID, b.traceMethod, len(b.backlog), b.err, r.err, bufferLen)
 	if b.err != nil {
 		if r.buffer != nil {
 			r.buffer.Free()
 		}
-		err := b.err
 		b.mu.Unlock()
-		seq = b.deleteMeTraceNextSeq()
-		fmt.Printf("DELETEME: (recvBuffer) (rx) put_dropped seq=%d recv=%p stream_id=%d method=%q reason_existing_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, err)
 		return
 	}
 	if r.err != nil {
 		b.err = r.err
 	}
-	seq = b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) put_before_enqueue seq=%d recv=%p stream_id=%d method=%q backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, len(b.backlog), b.err)
 	if len(b.backlog) == 0 {
 		select {
 		case b.c <- r:
-			latchedErr := b.err
 			b.mu.Unlock()
-			seq = b.deleteMeTraceNextSeq()
-			fmt.Printf("DELETEME: (recvBuffer) (rx) put_direct_to_chan seq=%d recv=%p stream_id=%d method=%q latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, latchedErr)
 			return
 		default:
 		}
 	}
 	b.backlog = append(b.backlog, r)
-	backlogLen := len(b.backlog)
-	latchedErr := b.err
 	b.mu.Unlock()
-	seq = b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) put_backlog_append seq=%d recv=%p stream_id=%d method=%q backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, backlogLen, latchedErr)
 }
 
 func (b *recvBuffer) load() {
 	b.mu.Lock()
-	seq := b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) load_start seq=%d recv=%p stream_id=%d method=%q backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, len(b.backlog), b.err)
 	if len(b.backlog) > 0 {
 		msg := b.backlog[0]
 		select {
 		case b.c <- msg:
 			b.backlog[0] = recvMsg{}
 			b.backlog = b.backlog[1:]
-			bufferLen := 0
-			if msg.buffer != nil {
-				bufferLen = msg.buffer.Len()
-			}
-			remaining := len(b.backlog)
-			latchedErr := b.err
 			b.mu.Unlock()
-			seq = b.deleteMeTraceNextSeq()
-			fmt.Printf("DELETEME: (recvBuffer) (rx) load_sent seq=%d recv=%p stream_id=%d method=%q remaining_backlog=%d latched_err=%v item_err=%v item_buf_len=%d\n", seq, b, b.traceStreamID, b.traceMethod, remaining, latchedErr, msg.err, bufferLen)
 			return
 		default:
 		}
 	}
-	backlogLen := len(b.backlog)
-	latchedErr := b.err
 	b.mu.Unlock()
-	seq = b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) load_noop seq=%d recv=%p stream_id=%d method=%q backlog_len=%d latched_err=%v\n", seq, b, b.traceStreamID, b.traceMethod, backlogLen, latchedErr)
 }
 
 // get returns the channel that receives a recvMsg in the buffer.
@@ -164,8 +120,6 @@ func (b *recvBuffer) load() {
 // Upon receipt of a recvMsg, the caller should call load to send another
 // recvMsg onto the channel if there is any.
 func (b *recvBuffer) get() <-chan recvMsg {
-	seq := b.deleteMeTraceNextSeq()
-	fmt.Printf("DELETEME: (recvBuffer) (rx) get_chan seq=%d recv=%p stream_id=%d method=%q\n", seq, b, b.traceStreamID, b.traceMethod)
 	return b.c
 }
 
@@ -182,20 +136,10 @@ type recvBufferReader struct {
 
 func (r *recvBufferReader) ReadMessageHeader(header []byte) (n int, err error) {
 	if r.err != nil {
-		if r.recv != nil {
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_sticky_err stream_id=%d method=%q err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, r.err)
-		}
 		return 0, r.err
 	}
 	if r.last != nil {
 		n, r.last = mem.ReadUnsafe(header, r.last)
-		if r.recv != nil {
-			remaining := 0
-			if r.last != nil {
-				remaining = r.last.Len()
-			}
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_from_last stream_id=%d method=%q n=%d remaining_last=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, remaining)
-		}
 		return n, nil
 	}
 	if r.closeStream != nil {
@@ -212,9 +156,6 @@ func (r *recvBufferReader) ReadMessageHeader(header []byte) (n int, err error) {
 // error.
 func (r *recvBufferReader) Read(n int) (buf mem.Buffer, err error) {
 	if r.err != nil {
-		if r.recv != nil {
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_sticky_err stream_id=%d method=%q want=%d err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, n, r.err)
-		}
 		return nil, r.err
 	}
 	if r.last != nil {
@@ -223,13 +164,6 @@ func (r *recvBufferReader) Read(n int) (buf mem.Buffer, err error) {
 			buf, r.last = mem.SplitUnsafe(buf, n)
 		} else {
 			r.last = nil
-		}
-		if r.recv != nil {
-			remaining := 0
-			if r.last != nil {
-				remaining = r.last.Len()
-			}
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_from_last stream_id=%d method=%q want=%d got=%d remaining_last=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, buf.Len(), remaining)
 		}
 		return buf, nil
 	}
@@ -242,107 +176,41 @@ func (r *recvBufferReader) Read(n int) (buf mem.Buffer, err error) {
 }
 
 func (r *recvBufferReader) readMessageHeader(header []byte) (n int, err error) {
-	if r.recv != nil {
-		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_wait stream_id=%d method=%q\n", r.recv.traceStreamID, r.recv.traceMethod)
-	}
 	select {
 	case <-r.ctxDone:
-		if r.recv != nil {
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_ctx_done stream_id=%d method=%q err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, r.ctx.Err())
-		}
 		return 0, ContextErr(r.ctx.Err())
 	case m := <-r.recv.get():
-		if r.recv != nil {
-			bufferLen := 0
-			if m.buffer != nil {
-				bufferLen = m.buffer.Len()
-			}
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_received stream_id=%d method=%q msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, m.err, bufferLen)
-		}
 		return r.readMessageHeaderAdditional(m, header)
 	}
 }
 
 func (r *recvBufferReader) read(n int) (buf mem.Buffer, err error) {
-	if r.recv != nil {
-		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_wait stream_id=%d method=%q want=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n)
-	}
 	select {
 	case <-r.ctxDone:
-		if r.recv != nil {
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_ctx_done stream_id=%d method=%q want=%d err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, n, r.ctx.Err())
-		}
 		return nil, ContextErr(r.ctx.Err())
 	case m := <-r.recv.get():
-		if r.recv != nil {
-			bufferLen := 0
-			if m.buffer != nil {
-				bufferLen = m.buffer.Len()
-			}
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_received stream_id=%d method=%q want=%d msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.err, bufferLen)
-		}
 		return r.readAdditional(m, n)
 	}
 }
 
 func (r *recvBufferReader) readMessageHeaderClient(header []byte) (n int, err error) {
-	if r.recv != nil {
-		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_client_wait stream_id=%d method=%q\n", r.recv.traceStreamID, r.recv.traceMethod)
-	}
 	select {
 	case <-r.ctxDone:
-		if r.recv != nil {
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_client_ctx_done stream_id=%d method=%q err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, r.ctx.Err())
-		}
 		r.closeStream(ContextErr(r.ctx.Err()))
 		m := <-r.recv.get()
-		if r.recv != nil {
-			bufferLen := 0
-			if m.buffer != nil {
-				bufferLen = m.buffer.Len()
-			}
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_client_received_after_close stream_id=%d method=%q msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, m.err, bufferLen)
-		}
 		return r.readMessageHeaderAdditional(m, header)
 	case m := <-r.recv.get():
-		if r.recv != nil {
-			bufferLen := 0
-			if m.buffer != nil {
-				bufferLen = m.buffer.Len()
-			}
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_client_received stream_id=%d method=%q msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, m.err, bufferLen)
-		}
 		return r.readMessageHeaderAdditional(m, header)
 	}
 }
 
 func (r *recvBufferReader) readClient(n int) (buf mem.Buffer, err error) {
-	if r.recv != nil {
-		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_client_wait stream_id=%d method=%q want=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n)
-	}
 	select {
 	case <-r.ctxDone:
-		if r.recv != nil {
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_client_ctx_done stream_id=%d method=%q want=%d err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, n, r.ctx.Err())
-		}
 		r.closeStream(ContextErr(r.ctx.Err()))
 		m := <-r.recv.get()
-		if r.recv != nil {
-			bufferLen := 0
-			if m.buffer != nil {
-				bufferLen = m.buffer.Len()
-			}
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_client_received_after_close stream_id=%d method=%q want=%d msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.err, bufferLen)
-		}
 		return r.readAdditional(m, n)
 	case m := <-r.recv.get():
-		if r.recv != nil {
-			bufferLen := 0
-			if m.buffer != nil {
-				bufferLen = m.buffer.Len()
-			}
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_client_received stream_id=%d method=%q want=%d msg_err=%v msg_buf_len=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.err, bufferLen)
-		}
 		return r.readAdditional(m, n)
 	}
 }
@@ -353,20 +221,10 @@ func (r *recvBufferReader) readMessageHeaderAdditional(m recvMsg, header []byte)
 		if m.buffer != nil {
 			m.buffer.Free()
 		}
-		if r.recv != nil {
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_additional_err stream_id=%d method=%q err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, m.err)
-		}
 		return 0, m.err
 	}
 
 	n, r.last = mem.ReadUnsafe(header, m.buffer)
-	if r.recv != nil {
-		remaining := 0
-		if r.last != nil {
-			remaining = r.last.Len()
-		}
-		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_message_header_additional_ok stream_id=%d method=%q n=%d remaining_last=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, remaining)
-	}
 	return n, nil
 }
 
@@ -376,21 +234,11 @@ func (r *recvBufferReader) readAdditional(m recvMsg, n int) (b mem.Buffer, err e
 		if m.buffer != nil {
 			m.buffer.Free()
 		}
-		if r.recv != nil {
-			fmt.Printf("DELETEME: (recvBufferReader) (rx) read_additional_err stream_id=%d method=%q want=%d err=%v\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.err)
-		}
 		return nil, m.err
 	}
 
 	if m.buffer.Len() > n {
 		m.buffer, r.last = mem.SplitUnsafe(m.buffer, n)
-	}
-	if r.recv != nil {
-		remaining := 0
-		if r.last != nil {
-			remaining = r.last.Len()
-		}
-		fmt.Printf("DELETEME: (recvBufferReader) (rx) read_additional_ok stream_id=%d method=%q want=%d got=%d remaining_last=%d\n", r.recv.traceStreamID, r.recv.traceMethod, n, m.buffer.Len(), remaining)
 	}
 	return m.buffer, nil
 }
@@ -465,7 +313,6 @@ func (s *Stream) ID() uint32 {
 }
 
 func (s *Stream) write(m recvMsg) {
-	s.buf.deleteMeTraceSet(s.method, s.id)
 	s.buf.put(m)
 }
 
