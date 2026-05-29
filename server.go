@@ -845,13 +845,7 @@ func PinThreadToCPU(cpuID int) error {
 //
 // [1] https://github.com/golang/go/issues/18138
 func (s *Server) serverWorker(workerID int, cpuID int) {
-	if s.komaWorkerMode == komaWorkerModePinned && cpuID >= 0 {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-		if err := PinThreadToCPU(cpuID); err != nil {
-			panic(err)
-		}
-	}
+	fmt.Printf("worker %d (unpinned, cpuID hint %d)\n", workerID, cpuID)
 
 	komafd := koma.KomaInit()
 	// TODO(Rui): locking here for concurrent access to the shared list of all koma fds
