@@ -114,8 +114,8 @@ const (
 type KomaThreadingModeValue string
 
 const (
-	KomaRTC  KomaThreadingModeValue = "rtc"
-	KomaAsym KomaThreadingModeValue = "asym"
+	KomaRTC            KomaThreadingModeValue = "rtc"
+	KomaSymNonblocking KomaThreadingModeValue = "sym-nonblocking"
 )
 
 type komaWorkerMode string
@@ -151,10 +151,10 @@ func parseKomaThreadingMode(threadingModelEnv string) (KomaThreadingModeValue, e
 	switch strings.ToLower(strings.TrimSpace(threadingModelEnv)) {
 	case "", "rtc", "symmetric", "sym":
 		return KomaRTC, nil
-	case "asym", "asymmetric":
-		return KomaAsym, nil
+	case "sym-nonblocking", "symmetric-nonblocking", "nonblocking":
+		return KomaSymNonblocking, nil
 	default:
-		return "", fmt.Errorf("invalid %s value %q: must be one of rtc, symmetric, asym, asymmetric", grpcKomaThreadingModelEnvName, threadingModelEnv)
+		return "", fmt.Errorf("invalid %s value %q: must be one of rtc, symmetric, sym-nonblocking, symmetric-nonblocking", grpcKomaThreadingModelEnvName, threadingModelEnv)
 	}
 }
 
@@ -858,7 +858,15 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 	s.mu.Lock()
 	s.komafds = append(s.komafds, komafd)
 	s.mu.Unlock()
-	komaConn, _ := http2.NewKomaConn(komafd)
+	komaConn, err := http2.NewKomaConn(komafd)
+	if err != nil {
+		panic(err)
+	}
+	if s.usesKomaAsyncTX() {
+		if err := komaConn.SetRequireReplyCookie(true); err != nil {
+			panic(err)
+		}
+	}
 
 	// create a dedicated new transport for the koma connection, note that it is
 	// different from the serverTransport of a normal TCP connection
@@ -879,10 +887,21 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 		}
 	}()
 
-	// streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
+	streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
 	st.HandleStreamsKoma(ctx, int(komafd), func(stream *transport.ServerStream) {
+		if stream == nil {
+			return
+		}
+		if s.komaThreadingMode == KomaSymNonblocking {
+			s.dispatchKomaStreamNonblocking(streamQuota, st, stream)
+			return
+		}
 		s.handleStream(st, stream)
 	})
+}
+
+func (s *Server) usesKomaAsyncTX() bool {
+	return s.komaThreadingMode == KomaSymNonblocking
 }
 
 func (s *Server) komaWorkerCPU(workerID int) int {
@@ -930,77 +949,14 @@ func (s *Server) initServerWorkers() {
 	}
 }
 
-func (s *Server) dispatchKomaStream(streamQuota *atomicSemaphore, st transport.ServerTransport, stream *transport.ServerStream) {
-	s.handlersWG.Add(1)
+func (s *Server) dispatchKomaStreamNonblocking(streamQuota *atomicSemaphore, st transport.ServerTransport, stream *transport.ServerStream) {
 	streamQuota.acquire()
-	f := func() {
+	s.handlersWG.Add(1)
+	go func() {
 		defer streamQuota.release()
 		defer s.handlersWG.Done()
 		s.handleStream(st, stream)
-	}
-
-	if s.serverWorkerChannel != nil {
-		select {
-		case s.serverWorkerChannel <- f:
-			return
-		default:
-			// If all workers are busy, fallback to the default code path.
-		}
-	}
-	go f()
-}
-
-func (s *Server) startKomaAsym() {
-	s.initStreamWorkers()
-	go s.komaAsymIOWorker()
-}
-
-func (s *Server) komaAsymIOWorker() {
-	ioCPU := s.komaWorkerCPU(0)
-	if s.komaWorkerMode == komaWorkerModePinned && ioCPU >= 0 {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-		if err := PinThreadToCPU(ioCPU); err != nil {
-			panic(err)
-		}
-	}
-
-	komafd := koma.KomaInit()
-
-	s.mu.Lock()
-	s.komafds = append(s.komafds, komafd)
-	s.mu.Unlock()
-
-	komaConn, err := http2.NewKomaConn(komafd)
-	if err != nil {
-		panic(err)
-	}
-	if err := komaConn.SetRequireReplyCookie(true); err != nil {
-		panic(err)
-	}
-
-	st := s.newHTTP2Transport(komaConn, true)
-
-	ctx := transport.SetConnection(context.Background(), komaConn)
-	ctx = peer.NewContext(ctx, st.Peer())
-	for _, sh := range s.opts.statsHandlers {
-		sh.HandleConn(ctx, &stats.ConnEnd{})
-	}
-
-	defer func() {
-		st.Close(errors.New("finished serving streams for the server transport"))
-		for _, sh := range s.opts.statsHandlers {
-			sh.HandleConn(ctx, &stats.ConnEnd{})
-		}
 	}()
-
-	streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
-	st.HandleStreamsKoma(ctx, int(komafd), func(stream *transport.ServerStream) {
-		if stream == nil {
-			return
-		}
-		s.dispatchKomaStream(streamQuota, st, stream)
-	})
 }
 
 // NewServer creates a gRPC server which has no service registered and has not
@@ -1056,7 +1012,7 @@ func NewServer(opt ...ServerOption) *Server {
 	}
 
 	switch s.komaThreadingMode {
-	case KomaRTC, KomaAsym:
+	case KomaRTC, KomaSymNonblocking:
 	default:
 		logger.Fatalf("grpc: invalid Koma threading mode %q", s.komaThreadingMode)
 	}
@@ -1065,11 +1021,7 @@ func NewServer(opt ...ServerOption) *Server {
 		if !s.komaEnabled {
 			logger.Fatalf("grpc: numServerWorkers > 0 but %s is not set", grpcKomaEnabledEnvName)
 		}
-		if s.komaThreadingMode == KomaAsym {
-			s.startKomaAsym()
-		} else {
-			s.initServerWorkers()
-		}
+		s.initServerWorkers()
 	}
 
 	channelz.Info(logger, s.channelz, "Server created")
@@ -1454,7 +1406,7 @@ func (s *Server) newHTTP2Transport(c net.Conn, ifkoma bool) transport.ServerTran
 		HeaderTableSize:       s.opts.headerTableSize,
 		BufferPool:            s.opts.bufferPool,
 	}
-	st, err := transport.NewServerTransport(c, config, ifkoma, ifkoma && s.komaThreadingMode == KomaAsym)
+	st, err := transport.NewServerTransport(c, config, ifkoma, ifkoma && s.usesKomaAsyncTX())
 	//if ifkoma {
 	//fmt.Printf("create koma http transport %+v %v\n", st, err)
 	//}

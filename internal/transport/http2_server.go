@@ -165,8 +165,8 @@ type http2Server struct {
 	hBuf *bytes.Buffer  // The buffer for HPACK encoding.
 	hEnc *hpack.Encoder // HPACK encoder.
 
-	komaAsym  bool
-	komaTxOps chan *komaTxOp
+	komaAsyncTX bool
+	komaTxOps   chan *komaTxOp
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -176,7 +176,7 @@ type http2Server struct {
 // returns a nil transport and a non-nil error. For a special case where the
 // underlying conn gets closed before the client preface could be read, it
 // returns a nil transport and a nil error.
-func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool, komaAsym bool) (_ ServerTransport, err error) {
+func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool, komaAsyncTX bool) (_ ServerTransport, err error) {
 	var authInfo credentials.AuthInfo
 	rawConn := conn
 	if config.Credentials != nil {
@@ -311,12 +311,12 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool, komaAs
 		bufferPool:        config.BufferPool,
 		hBuf:              &buf,
 		hEnc:              hpack.NewEncoder(&buf),
-		komaAsym:          komaAsym,
+		komaAsyncTX:       komaAsyncTX,
 	}
 	if ifkoma {
 		t.controlBuf = newControlBuffer(t.done)
 		close(t.loopyWriterDone)
-		if komaAsym {
+		if komaAsyncTX {
 			t.komaTxOps = make(chan *komaTxOp, 128)
 			go t.komaTxWorker()
 		}
@@ -404,7 +404,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool, komaAs
 
 // handle earlyabortstreams, adapted from func (l *loopyWriter) earlyAbortStreamHandler(eas *earlyAbortStream)
 func (t *http2Server) processEarlyAbortStream(eas *earlyAbortStream, replyHandle uint64) error {
-	if t.komaAsym {
+	if t.komaAsyncTX {
 		copyEAS := *eas
 		return t.queueKomaTx(&komaTxOp{
 			kind:        komaTxEarlyAbort,
@@ -447,7 +447,7 @@ func (t *http2Server) processEarlyAbortStreamDirect(eas *earlyAbortStream, reply
 }
 
 func (t *http2Server) processCleanupStream(streamID uint32, rstCode http2.ErrCode, replyHandle uint64) error {
-	if t.komaAsym {
+	if t.komaAsyncTX {
 		return t.queueKomaTx(&komaTxOp{
 			kind:        komaTxCleanup,
 			streamID:    streamID,
@@ -1150,8 +1150,8 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 }
 
 func (t *http2Server) queueKomaTx(op *komaTxOp) error {
-	if !t.komaAsym {
-		return errors.New("queueKomaTx called when Koma asymmetric mode is disabled")
+	if !t.komaAsyncTX {
+		return errors.New("queueKomaTx called when Koma async TX is disabled")
 	}
 	op.done = make(chan error, 1)
 	select {
@@ -1428,7 +1428,7 @@ func (t *http2Server) streamContextErr(s *ServerStream) error {
 
 // WriteHeader sends the header metadata md back to the client.
 func (t *http2Server) writeHeader(s *ServerStream, md metadata.MD) error {
-	if t.komaAsym {
+	if t.komaAsyncTX {
 		return t.queueKomaTx(&komaTxOp{
 			kind:   komaTxWriteHeader,
 			stream: s,
@@ -1598,7 +1598,7 @@ func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 // TODO(zhaoq): Now it indicates the end of entire stream. Revisit if early
 // OK is adopted.
 func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
-	if t.komaAsym {
+	if t.komaAsyncTX {
 		return t.queueKomaTx(&komaTxOp{
 			kind:   komaTxWriteStatus,
 			stream: s,
@@ -1678,7 +1678,7 @@ func (t *http2Server) writeStatusDirect(s *ServerStream, st *status.Status) erro
 // Write converts the data into HTTP2 data frame and sends it out. Non-nil error
 // is returns if it fails (e.g., framing error, transport error).
 func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
-	if t.komaAsym {
+	if t.komaAsyncTX {
 		hdrCopy := append([]byte(nil), hdr...)
 		return t.queueKomaTx(&komaTxOp{
 			kind:   komaTxWriteData,
