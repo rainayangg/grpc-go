@@ -28,6 +28,7 @@ import (
 	rand "math/rand/v2"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,8 @@ var (
 	// than the limit set by peer.
 	ErrHeaderListSizeLimitViolation = status.Error(codes.Internal, "transport: trying to send header list size larger than the limit set by peer")
 )
+
+var debugKomaBatch = os.Getenv("GRPC_KOMA_DEBUG_BATCH") == "1" || os.Getenv("GRPC_KOMA_DEBUG_BATCH") == "true"
 
 type komaTxKind int
 
@@ -987,7 +990,12 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		}
 
 		batchInfo := analyzeKomaBatch(frames)
-		if batchInfo.uniqueStreamIDs > 1 || batchInfo.metaHeaders > 1 {
+		if debugKomaBatch && (batchInfo.uniqueStreamIDs > 1 || batchInfo.metaHeaders > 1) {
+			fmt.Printf(
+				"http2-koma: suspicious batch komafd=%d frames=%d reply_handle=%d reply_flags=0x%x unique_stream_ids=%d meta_headers=%d frame_kinds=%v\n",
+				komafd, len(frames), replyCookie.Handle, replyCookie.Flags,
+				batchInfo.uniqueStreamIDs, batchInfo.metaHeaders, batchInfo.frameKinds,
+			)
 		}
 
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
