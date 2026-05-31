@@ -69,7 +69,12 @@ var (
 	ErrHeaderListSizeLimitViolation = status.Error(codes.Internal, "transport: trying to send header list size larger than the limit set by peer")
 )
 
-var debugKomaBatch = os.Getenv("GRPC_KOMA_DEBUG_BATCH") == "1" || os.Getenv("GRPC_KOMA_DEBUG_BATCH") == "true"
+var (
+	debugKomaBatch = os.Getenv("GRPC_KOMA_DEBUG_BATCH") == "1" || os.Getenv("GRPC_KOMA_DEBUG_BATCH") == "true"
+	debugKomaTx    = os.Getenv("GRPC_KOMA_DEBUG_TX") == "1" || os.Getenv("GRPC_KOMA_DEBUG_TX") == "true"
+
+	komaTxDebugSeq uint64
+)
 
 type komaTxKind int
 
@@ -94,6 +99,98 @@ type komaTxOp struct {
 	earlyAbort  *earlyAbortStream
 	replyHandle uint64
 	done        chan error
+}
+
+func (k komaTxKind) String() string {
+	switch k {
+	case komaTxWriteHeader:
+		return "write-header"
+	case komaTxWriteData:
+		return "write-data"
+	case komaTxWriteStatus:
+		return "write-status"
+	case komaTxCleanup:
+		return "cleanup"
+	case komaTxEarlyAbort:
+		return "early-abort"
+	default:
+		return fmt.Sprintf("unknown-%d", k)
+	}
+}
+
+func debugKomaTxf(format string, args ...any) {
+	if !debugKomaTx {
+		return
+	}
+	seq := atomic.AddUint64(&komaTxDebugSeq, 1)
+	allArgs := append([]any{seq}, args...)
+	fmt.Printf("http2-koma-tx[%d]: "+format+"\n", allArgs...)
+}
+
+func debugKomaStreamID(s *ServerStream, fallback uint32) uint32 {
+	if s == nil {
+		return fallback
+	}
+	return s.id
+}
+
+func debugKomaReplyHandle(s *ServerStream, fallback uint64) uint64 {
+	if s == nil {
+		return fallback
+	}
+	return s.KomaReplyHandle
+}
+
+func debugKomaHeaderSent(s *ServerStream) bool {
+	return s != nil && s.isHeaderSent()
+}
+
+func debugKomaStreamState(s *ServerStream) streamState {
+	if s == nil {
+		return streamDone
+	}
+	return s.getState()
+}
+
+func debugKomaHeaderFields(fields []hpack.HeaderField) []string {
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		switch f.Name {
+		case ":status", "content-type", "grpc-status", "grpc-message":
+			out = append(out, fmt.Sprintf("%s=%q", f.Name, f.Value))
+		default:
+			out = append(out, f.Name)
+		}
+	}
+	return out
+}
+
+func debugKomaTxOp(phase string, op *komaTxOp, err error) {
+	if !debugKomaTx {
+		return
+	}
+	if op == nil {
+		debugKomaTxf("%s nil-op", phase)
+		return
+	}
+
+	mdLen := 0
+	if op.md != nil {
+		mdLen = op.md.Len()
+	}
+	grpcStatus := "<nil>"
+	if op.status != nil {
+		grpcStatus = fmt.Sprintf("%v", op.status.Code())
+	}
+	if err != nil {
+		debugKomaTxf("%s kind=%s stream=%d reply_handle=%d header_sent=%t state=%v md_len=%d hdr_bytes=%d data_bytes=%d grpc_status=%s rst_code=%v err=%v",
+			phase, op.kind, debugKomaStreamID(op.stream, op.streamID), debugKomaReplyHandle(op.stream, op.replyHandle),
+			debugKomaHeaderSent(op.stream), debugKomaStreamState(op.stream), mdLen, len(op.hdr), op.data.Len(), grpcStatus, op.rstCode, err)
+		return
+	}
+	debugKomaTxf("%s kind=%s stream=%d reply_handle=%d header_sent=%t state=%v md_len=%d hdr_bytes=%d data_bytes=%d grpc_status=%s rst_code=%v",
+		phase, op.kind, debugKomaStreamID(op.stream, op.streamID), debugKomaReplyHandle(op.stream, op.replyHandle),
+		debugKomaHeaderSent(op.stream), debugKomaStreamState(op.stream), mdLen, len(op.hdr), op.data.Len(), grpcStatus, op.rstCode)
 }
 
 // serverConnectionCounter counts the number of connections a server has seen
@@ -1161,6 +1258,7 @@ func (t *http2Server) queueKomaTx(op *komaTxOp) error {
 	if !t.komaAsyncTX {
 		return errors.New("queueKomaTx called when Koma async TX is disabled")
 	}
+	debugKomaTxOp("queue", op, nil)
 	op.done = make(chan error, 1)
 	select {
 	case <-t.done:
@@ -1185,7 +1283,9 @@ func (t *http2Server) komaTxWorker() {
 			if op == nil {
 				continue
 			}
+			debugKomaTxOp("execute-start", op, nil)
 			err := t.executeKomaTx(op)
+			debugKomaTxOp("execute-done", op, err)
 			op.done <- err
 			close(op.done)
 		}
@@ -1196,6 +1296,7 @@ func (t *http2Server) setKomaReplyCookie(handle uint64, flags uint32) {
 	if t == nil || t.framer == nil || t.framer.komaWriter() == nil || handle == 0 {
 		return
 	}
+	debugKomaTxf("set-cookie reply_handle=%d flags=0x%x final=%t", handle, flags, flags&http2.KomaReplyCookieFlagFinal != 0)
 	t.framer.komaWriter().SetReplyCookie(http2.KomaReplyCookie{
 		Handle: handle,
 		Flags:  flags,
@@ -1449,11 +1550,19 @@ func (t *http2Server) writeHeader(s *ServerStream, md metadata.MD) error {
 func (t *http2Server) writeHeaderDirect(s *ServerStream, md metadata.MD) error {
 	s.hdrMu.Lock()
 	defer s.hdrMu.Unlock()
+	mdLen := 0
+	if md != nil {
+		mdLen = md.Len()
+	}
+	debugKomaTxf("write-header-direct stream=%d reply_handle=%d header_sent_before=%t state=%v md_len=%d",
+		s.id, s.KomaReplyHandle, s.isHeaderSent(), s.getState(), mdLen)
 	if s.getState() == streamDone {
 		return t.streamContextErr(s)
 	}
 
-	if s.updateHeaderSent() {
+	headerAlreadySent := s.updateHeaderSent()
+	debugKomaTxf("write-header-update stream=%d already_sent=%t", s.id, headerAlreadySent)
+	if headerAlreadySent {
 		return ErrIllegalHeaderWrite
 	}
 
@@ -1497,6 +1606,8 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame, replyH
 	// }
 	// below is the logic of func (l *loopyWriter) writeHeader(): split the
 	// fmt.Printf("processHeaderFrame: 0\n")
+	debugKomaTxf("header-frame stream=%d reply_handle=%d end_stream=%t retire=%t fields=%v",
+		streamId, replyHandle, h.endStream, retireOnLastFrame, debugKomaHeaderFields(h.hf))
 	if h.onWrite != nil {
 		h.onWrite()
 	}
@@ -1529,6 +1640,8 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame, replyH
 			if endHeaders && retireOnLastFrame {
 				replyFlags = http2.KomaReplyCookieFlagFinal
 			}
+			debugKomaTxf("write-headers stream=%d reply_handle=%d flags=0x%x final=%t end_stream=%t end_headers=%t block_bytes=%d",
+				streamId, replyHandle, replyFlags, replyFlags&http2.KomaReplyCookieFlagFinal != 0, h.endStream, endHeaders, size)
 			t.setKomaReplyCookie(replyHandle, replyFlags)
 			err = t.framer.komaWriter().WriteHeaders(http2.HeadersFrameParam{
 				StreamID:      streamId,
@@ -1542,6 +1655,8 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame, replyH
 			if endHeaders && retireOnLastFrame {
 				replyFlags = http2.KomaReplyCookieFlagFinal
 			}
+			debugKomaTxf("write-continuation stream=%d reply_handle=%d flags=0x%x final=%t end_headers=%t block_bytes=%d",
+				streamId, replyHandle, replyFlags, replyFlags&http2.KomaReplyCookieFlagFinal != 0, endHeaders, size)
 			t.setKomaReplyCookie(replyHandle, replyFlags)
 			err = t.framer.komaWriter().WriteContinuation(
 				streamId,
@@ -1582,6 +1697,7 @@ func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 		endStream: false,
 		onWrite:   t.setResetPingStrikes,
 	}
+	debugKomaTxf("write-header-locked stream=%d reply_handle=%d fields=%v", s.id, s.KomaReplyHandle, debugKomaHeaderFields(headerFields))
 	// fmt.Printf("writeHeaderLocked: 1\n")
 	// success, err := t.controlBuf.executeAndPut(func() bool { return t.checkForHeaderListSize(hf) }, hf)
 	err := t.processHeaderFrame(s.id, hf, s.KomaReplyHandle, false)
@@ -1619,6 +1735,8 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 func (t *http2Server) writeStatusDirect(s *ServerStream, st *status.Status) error {
 	s.hdrMu.Lock()
 	defer s.hdrMu.Unlock()
+	debugKomaTxf("write-status-direct stream=%d reply_handle=%d header_sent_before=%t state=%v grpc_status=%v header_md_len=%d trailer_len=%d",
+		s.id, s.KomaReplyHandle, s.isHeaderSent(), s.getState(), st.Code(), s.header.Len(), s.trailer.Len())
 
 	if s.getState() == streamDone {
 		return nil
@@ -1627,7 +1745,9 @@ func (t *http2Server) writeStatusDirect(s *ServerStream, st *status.Status) erro
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
 	headerFields := make([]hpack.HeaderField, 0, 2) // grpc-status and grpc-message will be there if none else.
-	if !s.updateHeaderSent() {                      // No headers have been sent.
+	headerAlreadySent := s.updateHeaderSent()
+	debugKomaTxf("write-status-update stream=%d already_sent=%t", s.id, headerAlreadySent)
+	if !headerAlreadySent { // No headers have been sent.
 		if len(s.header) > 0 { // Send a separate header frame.
 			if err := t.writeHeaderLocked(s); err != nil {
 				return err
@@ -1661,6 +1781,7 @@ func (t *http2Server) writeStatusDirect(s *ServerStream, st *status.Status) erro
 		endStream: true,
 		onWrite:   t.setResetPingStrikes,
 	}
+	debugKomaTxf("write-status-trailer stream=%d reply_handle=%d fields=%v", s.id, s.KomaReplyHandle, debugKomaHeaderFields(headerFields))
 	// success, err := t.controlBuf.executeAndPut(func() bool {
 	// 	return t.checkForHeaderListSize(trailingHeader)
 	// }, nil)
@@ -1672,6 +1793,7 @@ func (t *http2Server) writeStatusDirect(s *ServerStream, st *status.Status) erro
 	}
 	// Send a RST_STREAM after the trailers if the client has not already half-closed.
 	rst := s.getState() == streamActive
+	debugKomaTxf("finish-after-status stream=%d reply_handle=%d rst=%t state=%v", s.id, s.KomaReplyHandle, rst, s.getState())
 	t.finishStream(s, rst, http2.ErrCodeNo, trailingHeader, true)
 	for _, sh := range t.stats {
 		// Note: The trailer fields are compressed with hpack after this call returns.
@@ -1701,6 +1823,8 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, o
 
 func (t *http2Server) writeDirect(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
 	// fmt.Printf("Write:0\n")
+	debugKomaTxf("write-data-direct stream=%d reply_handle=%d header_sent_before=%t state=%v hdr_bytes=%d data_bytes=%d",
+		s.id, s.KomaReplyHandle, s.isHeaderSent(), s.getState(), len(hdr), data.Len())
 	reader := data.Reader()
 
 	// fmt.Printf("Write: 1\n")
@@ -1746,6 +1870,8 @@ func (t *http2Server) writeDirect(s *ServerStream, hdr []byte, data mem.BufferSl
 		if df.endStream {
 			replyFlags = http2.KomaReplyCookieFlagFinal
 		}
+		debugKomaTxf("write-data-empty stream=%d reply_handle=%d flags=0x%x final=%t end_stream=%t",
+			df.streamID, s.KomaReplyHandle, replyFlags, replyFlags&http2.KomaReplyCookieFlagFinal != 0, df.endStream)
 		t.setKomaReplyCookieForStream(s, replyFlags)
 		if err := t.framer.komaWriter().WriteData(df.streamID, df.endStream, nil); err != nil {
 			return err
@@ -1772,6 +1898,8 @@ func (t *http2Server) writeDirect(s *ServerStream, hdr []byte, data mem.BufferSl
 		df.onEachWrite()
 	}
 	// fmt.Printf("http2_server.go: write: write data frame of size %d (header %d + data %d) on stream %d\n", hSize+dSize, hSize, dSize, df.streamID)
+	debugKomaTxf("write-data-frame stream=%d reply_handle=%d flags=0x0 final=false end_stream=%t header_bytes=%d data_bytes=%d total_bytes=%d",
+		df.streamID, s.KomaReplyHandle, df.endStream, hSize, dSize, hSize+dSize)
 	t.setKomaReplyCookieForStream(s, 0)
 	if err := t.framer.komaWriter().WriteData(df.streamID, df.endStream, (*buf)[:hSize+dSize]); err != nil {
 		return err
