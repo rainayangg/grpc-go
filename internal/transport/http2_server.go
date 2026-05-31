@@ -76,6 +76,8 @@ var (
 	komaTxDebugSeq uint64
 )
 
+const debugKomaFrameHeaderBytes = 9
+
 type komaTxKind int
 
 const (
@@ -165,12 +167,12 @@ func debugKomaHeaderFields(fields []hpack.HeaderField) []string {
 	return out
 }
 
-func debugKomaTxOp(phase string, op *komaTxOp, err error) {
+func debugKomaTxOp(phase string, t *http2Server, op *komaTxOp, err error) {
 	if !debugKomaTx {
 		return
 	}
 	if op == nil {
-		debugKomaTxf("%s nil-op", phase)
+		debugKomaTxf("transport=%p %s nil-op", t, phase)
 		return
 	}
 
@@ -183,14 +185,74 @@ func debugKomaTxOp(phase string, op *komaTxOp, err error) {
 		grpcStatus = fmt.Sprintf("%v", op.status.Code())
 	}
 	if err != nil {
-		debugKomaTxf("%s kind=%s stream=%d reply_handle=%d header_sent=%t state=%v md_len=%d hdr_bytes=%d data_bytes=%d grpc_status=%s rst_code=%v err=%v",
-			phase, op.kind, debugKomaStreamID(op.stream, op.streamID), debugKomaReplyHandle(op.stream, op.replyHandle),
+		debugKomaTxf("transport=%p %s kind=%s stream=%d reply_handle=%d header_sent=%t state=%v md_len=%d hdr_bytes=%d data_bytes=%d grpc_status=%s rst_code=%v err=%v",
+			t, phase, op.kind, debugKomaStreamID(op.stream, op.streamID), debugKomaReplyHandle(op.stream, op.replyHandle),
 			debugKomaHeaderSent(op.stream), debugKomaStreamState(op.stream), mdLen, len(op.hdr), op.data.Len(), grpcStatus, op.rstCode, err)
 		return
 	}
-	debugKomaTxf("%s kind=%s stream=%d reply_handle=%d header_sent=%t state=%v md_len=%d hdr_bytes=%d data_bytes=%d grpc_status=%s rst_code=%v",
-		phase, op.kind, debugKomaStreamID(op.stream, op.streamID), debugKomaReplyHandle(op.stream, op.replyHandle),
+	debugKomaTxf("transport=%p %s kind=%s stream=%d reply_handle=%d header_sent=%t state=%v md_len=%d hdr_bytes=%d data_bytes=%d grpc_status=%s rst_code=%v",
+		t, phase, op.kind, debugKomaStreamID(op.stream, op.streamID), debugKomaReplyHandle(op.stream, op.replyHandle),
 		debugKomaHeaderSent(op.stream), debugKomaStreamState(op.stream), mdLen, len(op.hdr), op.data.Len(), grpcStatus, op.rstCode)
+}
+
+func (t *http2Server) debugKomaBeforeSetCookie(handle uint64, flags uint32) {
+	if !debugKomaTx || t == nil {
+		return
+	}
+	if t.komaDebugPendingFrames == 0 || t.komaDebugPendingHandle == 0 || handle == 0 || handle == t.komaDebugPendingHandle {
+		return
+	}
+	debugKomaTxf("transport=%p pending-cookie-switch pending_reply_handle=%d new_reply_handle=%d pending_frames=%d pending_bytes=%d pending_first=%s pending_last=%s new_flags=0x%x new_final=%t",
+		t, t.komaDebugPendingHandle, handle, t.komaDebugPendingFrames, t.komaDebugPendingBytes,
+		t.komaDebugPendingFirst, t.komaDebugPendingLast, flags, flags&http2.KomaReplyCookieFlagFinal != 0)
+}
+
+func (t *http2Server) debugKomaRecordFrame(kind string, streamID uint32, handle uint64, flags uint32, frameBytes int, err error) {
+	if !debugKomaTx || t == nil {
+		return
+	}
+	final := flags&http2.KomaReplyCookieFlagFinal != 0
+	if err != nil {
+		debugKomaTxf("transport=%p batch-frame-error kind=%s stream=%d reply_handle=%d flags=0x%x final=%t frame_bytes=%d err=%v",
+			t, kind, streamID, handle, flags, final, frameBytes, err)
+		return
+	}
+	if frameBytes < debugKomaFrameHeaderBytes {
+		frameBytes = debugKomaFrameHeaderBytes
+	}
+	desc := fmt.Sprintf("%s(stream=%d,reply_handle=%d,final=%t)", kind, streamID, handle, final)
+	if t.komaDebugPendingFrames > 0 && t.komaDebugPendingHandle != 0 && handle != 0 && handle != t.komaDebugPendingHandle {
+		debugKomaTxf("transport=%p pending-frame-mix pending_reply_handle=%d new_reply_handle=%d kind=%s stream=%d pending_frames=%d pending_bytes=%d pending_first=%s pending_last=%s",
+			t, t.komaDebugPendingHandle, handle, kind, streamID, t.komaDebugPendingFrames,
+			t.komaDebugPendingBytes, t.komaDebugPendingFirst, t.komaDebugPendingLast)
+	}
+	if t.komaDebugPendingFrames == 0 {
+		t.komaDebugPendingHandle = handle
+		t.komaDebugPendingFirst = desc
+	}
+	t.komaDebugPendingFrames++
+	t.komaDebugPendingBytes += frameBytes
+	t.komaDebugPendingLast = desc
+	debugKomaTxf("transport=%p batch-add kind=%s stream=%d reply_handle=%d flags=0x%x final=%t frame_bytes=%d pending_reply_handle=%d pending_frames=%d pending_bytes=%d",
+		t, kind, streamID, handle, flags, final, frameBytes, t.komaDebugPendingHandle,
+		t.komaDebugPendingFrames, t.komaDebugPendingBytes)
+	if final {
+		debugKomaTxf("transport=%p batch-flush reply_handle=%d pending_reply_handle=%d pending_frames=%d pending_bytes=%d pending_first=%s pending_last=%s",
+			t, handle, t.komaDebugPendingHandle, t.komaDebugPendingFrames, t.komaDebugPendingBytes,
+			t.komaDebugPendingFirst, t.komaDebugPendingLast)
+		t.debugKomaClearPending()
+	}
+}
+
+func (t *http2Server) debugKomaClearPending() {
+	if t == nil {
+		return
+	}
+	t.komaDebugPendingHandle = 0
+	t.komaDebugPendingFrames = 0
+	t.komaDebugPendingBytes = 0
+	t.komaDebugPendingFirst = ""
+	t.komaDebugPendingLast = ""
 }
 
 // serverConnectionCounter counts the number of connections a server has seen
@@ -267,6 +329,12 @@ type http2Server struct {
 
 	komaAsyncTX bool
 	komaTxOps   chan *komaTxOp
+
+	komaDebugPendingHandle uint64
+	komaDebugPendingFrames int
+	komaDebugPendingBytes  int
+	komaDebugPendingFirst  string
+	komaDebugPendingLast   string
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -539,7 +607,9 @@ func (t *http2Server) processEarlyAbortStreamDirect(eas *earlyAbortStream, reply
 	}
 	if eas.rst {
 		t.setKomaReplyCookie(replyHandle, http2.KomaReplyCookieFlagFinal)
-		if err := t.framer.komaWriter().WriteRSTStream(eas.streamID, http2.ErrCodeNo); err != nil {
+		err := t.framer.komaWriter().WriteRSTStream(eas.streamID, http2.ErrCodeNo)
+		t.debugKomaRecordFrame("rst-stream", eas.streamID, replyHandle, http2.KomaReplyCookieFlagFinal, debugKomaFrameHeaderBytes+4, err)
+		if err != nil {
 			return err
 		}
 	}
@@ -560,7 +630,9 @@ func (t *http2Server) processCleanupStream(streamID uint32, rstCode http2.ErrCod
 
 func (t *http2Server) processCleanupStreamDirect(streamID uint32, rstCode http2.ErrCode, replyHandle uint64) error {
 	t.setKomaReplyCookie(replyHandle, http2.KomaReplyCookieFlagFinal)
-	return t.framer.komaWriter().WriteRSTStream(streamID, rstCode)
+	err := t.framer.komaWriter().WriteRSTStream(streamID, rstCode)
+	t.debugKomaRecordFrame("rst-stream", streamID, replyHandle, http2.KomaReplyCookieFlagFinal, debugKomaFrameHeaderBytes+4, err)
+	return err
 }
 
 // operateHeadersKoma takes action on the decoded headers. Returns an error if fatal
@@ -582,6 +654,8 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		headerWireLength: int(frame.Header().Length),
 		KomaReplyHandle:  replyHandle,
 	}
+	debugKomaTxf("transport=%p recv-headers-koma stream=%d reply_handle=%d frame_len=%d fields=%d end_stream=%t",
+		t, streamID, replyHandle, frame.Header().Length, len(frame.Fields), frame.StreamEnded())
 	var (
 		// if false, content-type was missing or invalid
 		isGRPC      = false
@@ -1258,7 +1332,7 @@ func (t *http2Server) queueKomaTx(op *komaTxOp) error {
 	if !t.komaAsyncTX {
 		return errors.New("queueKomaTx called when Koma async TX is disabled")
 	}
-	debugKomaTxOp("queue", op, nil)
+	debugKomaTxOp("queue", t, op, nil)
 	op.done = make(chan error, 1)
 	select {
 	case <-t.done:
@@ -1283,9 +1357,9 @@ func (t *http2Server) komaTxWorker() {
 			if op == nil {
 				continue
 			}
-			debugKomaTxOp("execute-start", op, nil)
+			debugKomaTxOp("execute-start", t, op, nil)
 			err := t.executeKomaTx(op)
-			debugKomaTxOp("execute-done", op, err)
+			debugKomaTxOp("execute-done", t, op, err)
 			op.done <- err
 			close(op.done)
 		}
@@ -1296,7 +1370,8 @@ func (t *http2Server) setKomaReplyCookie(handle uint64, flags uint32) {
 	if t == nil || t.framer == nil || t.framer.komaWriter() == nil || handle == 0 {
 		return
 	}
-	debugKomaTxf("set-cookie reply_handle=%d flags=0x%x final=%t", handle, flags, flags&http2.KomaReplyCookieFlagFinal != 0)
+	t.debugKomaBeforeSetCookie(handle, flags)
+	debugKomaTxf("transport=%p set-cookie reply_handle=%d flags=0x%x final=%t", t, handle, flags, flags&http2.KomaReplyCookieFlagFinal != 0)
 	t.framer.komaWriter().SetReplyCookie(http2.KomaReplyCookie{
 		Handle: handle,
 		Flags:  flags,
@@ -1640,6 +1715,7 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame, replyH
 			if endHeaders && retireOnLastFrame {
 				replyFlags = http2.KomaReplyCookieFlagFinal
 			}
+			frameBytes := debugKomaFrameHeaderBytes + size
 			debugKomaTxf("write-headers stream=%d reply_handle=%d flags=0x%x final=%t end_stream=%t end_headers=%t block_bytes=%d",
 				streamId, replyHandle, replyFlags, replyFlags&http2.KomaReplyCookieFlagFinal != 0, h.endStream, endHeaders, size)
 			t.setKomaReplyCookie(replyHandle, replyFlags)
@@ -1649,12 +1725,14 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame, replyH
 				EndStream:     h.endStream,
 				EndHeaders:    endHeaders,
 			})
+			t.debugKomaRecordFrame("headers", streamId, replyHandle, replyFlags, frameBytes, err)
 		} else {
 			// fmt.Printf("processHeaderFrame: 1.2\n")
 			var replyFlags uint32
 			if endHeaders && retireOnLastFrame {
 				replyFlags = http2.KomaReplyCookieFlagFinal
 			}
+			frameBytes := debugKomaFrameHeaderBytes + size
 			debugKomaTxf("write-continuation stream=%d reply_handle=%d flags=0x%x final=%t end_headers=%t block_bytes=%d",
 				streamId, replyHandle, replyFlags, replyFlags&http2.KomaReplyCookieFlagFinal != 0, endHeaders, size)
 			t.setKomaReplyCookie(replyHandle, replyFlags)
@@ -1663,6 +1741,7 @@ func (t *http2Server) processHeaderFrame(streamId uint32, h *headerFrame, replyH
 				endHeaders,
 				t.hBuf.Next(size),
 			)
+			t.debugKomaRecordFrame("continuation", streamId, replyHandle, replyFlags, frameBytes, err)
 		}
 		if err != nil {
 			fmt.Printf("processHeaderFrame: error writing headers: %v\n", err)
@@ -1873,7 +1952,9 @@ func (t *http2Server) writeDirect(s *ServerStream, hdr []byte, data mem.BufferSl
 		debugKomaTxf("write-data-empty stream=%d reply_handle=%d flags=0x%x final=%t end_stream=%t",
 			df.streamID, s.KomaReplyHandle, replyFlags, replyFlags&http2.KomaReplyCookieFlagFinal != 0, df.endStream)
 		t.setKomaReplyCookieForStream(s, replyFlags)
-		if err := t.framer.komaWriter().WriteData(df.streamID, df.endStream, nil); err != nil {
+		err := t.framer.komaWriter().WriteData(df.streamID, df.endStream, nil)
+		t.debugKomaRecordFrame("data", df.streamID, s.KomaReplyHandle, replyFlags, debugKomaFrameHeaderBytes, err)
+		if err != nil {
 			return err
 		}
 		_ = df.reader.Close()
@@ -1901,7 +1982,9 @@ func (t *http2Server) writeDirect(s *ServerStream, hdr []byte, data mem.BufferSl
 	debugKomaTxf("write-data-frame stream=%d reply_handle=%d flags=0x0 final=false end_stream=%t header_bytes=%d data_bytes=%d total_bytes=%d",
 		df.streamID, s.KomaReplyHandle, df.endStream, hSize, dSize, hSize+dSize)
 	t.setKomaReplyCookieForStream(s, 0)
-	if err := t.framer.komaWriter().WriteData(df.streamID, df.endStream, (*buf)[:hSize+dSize]); err != nil {
+	err := t.framer.komaWriter().WriteData(df.streamID, df.endStream, (*buf)[:hSize+dSize])
+	t.debugKomaRecordFrame("data", df.streamID, s.KomaReplyHandle, 0, debugKomaFrameHeaderBytes+hSize+dSize, err)
+	if err != nil {
 		return err
 	}
 	df.reader.Close()
