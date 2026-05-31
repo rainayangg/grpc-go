@@ -933,25 +933,14 @@ func (s *Server) initServerWorkers() {
 func (s *Server) dispatchKomaStream(streamQuota *atomicSemaphore, st transport.ServerTransport, stream *transport.ServerStream) {
 	s.handlersWG.Add(1)
 	streamQuota.acquire()
-	f := func() {
+	go func() {
 		defer streamQuota.release()
 		defer s.handlersWG.Done()
 		s.handleStream(st, stream)
-	}
-
-	if s.serverWorkerChannel != nil {
-		select {
-		case s.serverWorkerChannel <- f:
-			return
-		default:
-			// If all workers are busy, fallback to the default code path.
-		}
-	}
-	go f()
+	}()
 }
 
 func (s *Server) startKomaAsym() {
-	s.initStreamWorkers()
 	go s.komaAsymIOWorker()
 }
 
