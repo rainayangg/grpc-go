@@ -84,23 +84,34 @@ const (
 	komaTxWriteHeader komaTxKind = iota
 	komaTxWriteData
 	komaTxWriteStatus
+	komaTxUnaryResponse
 	komaTxCleanup
 	komaTxEarlyAbort
 )
 
 type komaTxOp struct {
-	kind        komaTxKind
-	stream      *ServerStream
-	streamID    uint32
-	md          metadata.MD
-	hdr         []byte
-	data        mem.BufferSlice
-	opts        *WriteOptions
-	status      *status.Status
-	rstCode     http2.ErrCode
-	earlyAbort  *earlyAbortStream
-	replyHandle uint64
-	done        chan error
+	kind           komaTxKind
+	stream         *ServerStream
+	streamID       uint32
+	md             metadata.MD
+	hdr            []byte
+	data           mem.BufferSlice
+	opts           *WriteOptions
+	status         *status.Status
+	headerMD       metadata.MD
+	trailerMD      metadata.MD
+	dataSet        bool
+	replyFlags     uint32
+	contentSubtype string
+	sendCompress   string
+	rstCode        http2.ErrCode
+	earlyAbort     *earlyAbortStream
+	replyHandle    uint64
+	done           chan error
+}
+
+type komaReplyCookieWriter interface {
+	WriteWithReplyCookie([]byte, uint64, uint32) (int, error)
 }
 
 func (k komaTxKind) String() string {
@@ -111,6 +122,8 @@ func (k komaTxKind) String() string {
 		return "write-data"
 	case komaTxWriteStatus:
 		return "write-status"
+	case komaTxUnaryResponse:
+		return "unary-response"
 	case komaTxCleanup:
 		return "cleanup"
 	case komaTxEarlyAbort:
@@ -329,6 +342,9 @@ type http2Server struct {
 
 	komaAsyncTX bool
 	komaTxOps   chan *komaTxOp
+
+	komaUnaryTxBuf    bytes.Buffer
+	komaUnaryTxFramer *http2.Framer
 
 	komaDebugPendingHandle uint64
 	komaDebugPendingFrames int
@@ -1348,6 +1364,24 @@ func (t *http2Server) queueKomaTx(op *komaTxOp) error {
 	}
 }
 
+func (t *http2Server) enqueueKomaTx(op *komaTxOp) error {
+	if !t.komaAsyncTX {
+		return errors.New("enqueueKomaTx called when Koma async TX is disabled")
+	}
+	debugKomaTxOp("enqueue", t, op, nil)
+	select {
+	case <-t.done:
+		return ErrConnClosing
+	case t.komaTxOps <- op:
+		return nil
+	default:
+		err := status.Error(codes.ResourceExhausted, "transport: KOMA TX response queue full")
+		fmt.Printf("http2-koma: ERROR TX queue full stream=%d reply_handle=%d err=%v\n",
+			debugKomaStreamID(op.stream, op.streamID), debugKomaReplyHandle(op.stream, op.replyHandle), err)
+		return err
+	}
+}
+
 func (t *http2Server) komaTxWorker() {
 	for {
 		select {
@@ -1360,8 +1394,16 @@ func (t *http2Server) komaTxWorker() {
 			debugKomaTxOp("execute-start", t, op, nil)
 			err := t.executeKomaTx(op)
 			debugKomaTxOp("execute-done", t, op, err)
-			op.done <- err
-			close(op.done)
+			if op.done != nil {
+				op.done <- err
+				close(op.done)
+				continue
+			}
+			if err != nil {
+				fmt.Printf("http2-koma: ERROR async TX failed kind=%s stream=%d reply_handle=%d err=%v\n",
+					op.kind, debugKomaStreamID(op.stream, op.streamID), debugKomaReplyHandle(op.stream, op.replyHandle), err)
+				t.Close(err)
+			}
 		}
 	}
 }
@@ -1393,12 +1435,222 @@ func (t *http2Server) executeKomaTx(op *komaTxOp) error {
 		return t.writeDirect(op.stream, op.hdr, op.data, op.opts)
 	case komaTxWriteStatus:
 		return t.writeStatusDirect(op.stream, op.status)
+	case komaTxUnaryResponse:
+		return t.executeKomaUnaryResponse(op)
 	case komaTxCleanup:
 		return t.processCleanupStreamDirect(op.streamID, op.rstCode, op.replyHandle)
 	case komaTxEarlyAbort:
 		return t.processEarlyAbortStreamDirect(op.earlyAbort, op.replyHandle)
 	default:
 		return fmt.Errorf("unknown Koma TX op kind %d", op.kind)
+	}
+}
+
+func (t *http2Server) executeKomaUnaryResponse(op *komaTxOp) error {
+	if op.dataSet {
+		defer op.data.Free()
+	}
+	if op.status == nil {
+		fmt.Printf("http2-koma: ERROR unary response missing status stream=%d reply_handle=%d\n", op.streamID, op.replyHandle)
+		op.status = status.New(codes.Internal, "transport: KOMA async TX status missing")
+	}
+
+	t.komaUnaryTxBuf.Reset()
+	if t.komaUnaryTxFramer == nil {
+		t.komaUnaryTxFramer = http2.NewFramer(&t.komaUnaryTxBuf, nil)
+	}
+
+	sendInitial := op.dataSet || op.headerMD.Len() > 0
+	trailerMD := op.trailerMD.Copy()
+	if sendInitial {
+		if err := t.writeKomaPrivateHeaders(t.komaUnaryTxFramer, op.streamID, false, komaInitialHeaderFields(op)); err != nil {
+			return err
+		}
+		t.emitKomaOutHeaderStats(op)
+		if op.dataSet {
+			if err := t.writeKomaPrivateData(t.komaUnaryTxFramer, op.streamID, op.hdr, op.data); err != nil {
+				return err
+			}
+		}
+		if err := t.writeKomaPrivateHeaders(t.komaUnaryTxFramer, op.streamID, true, t.komaStatusHeaderFields(op, false, trailerMD)); err != nil {
+			return err
+		}
+	} else {
+		if err := t.writeKomaPrivateHeaders(t.komaUnaryTxFramer, op.streamID, true, t.komaStatusHeaderFields(op, true, trailerMD)); err != nil {
+			return err
+		}
+	}
+
+	debugKomaTxf("unary-response-ready stream=%d reply_handle=%d flags=0x%x final=%t bytes=%d initial_headers=%t data_set=%t grpc_status=%v",
+		op.streamID, op.replyHandle, op.replyFlags, op.replyFlags&http2.KomaReplyCookieFlagFinal != 0,
+		t.komaUnaryTxBuf.Len(), sendInitial, op.dataSet, op.status.Code())
+	if err := t.writeKomaReplyBuffer(op, t.komaUnaryTxBuf.Bytes()); err != nil {
+		return err
+	}
+	if err := t.finishKomaStreamAfterTx(op.stream, op.stream != nil && op.stream.getState() == streamActive, http2.ErrCodeNo, true); err != nil {
+		return err
+	}
+	t.emitKomaOutTrailerStats(op, trailerMD)
+	return nil
+}
+
+func komaInitialHeaderFields(op *komaTxOp) []hpack.HeaderField {
+	headerFields := make([]hpack.HeaderField, 0, 2+op.headerMD.Len())
+	headerFields = append(headerFields, hpack.HeaderField{Name: ":status", Value: "200"})
+	headerFields = append(headerFields, hpack.HeaderField{Name: "content-type", Value: grpcutil.ContentType(op.contentSubtype)})
+	if op.sendCompress != "" {
+		headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-encoding", Value: op.sendCompress})
+	}
+	return appendHeaderFieldsFromMD(headerFields, op.headerMD)
+}
+
+func (t *http2Server) komaStatusHeaderFields(op *komaTxOp, trailerOnly bool, trailerMD metadata.MD) []hpack.HeaderField {
+	headerFields := make([]hpack.HeaderField, 0, 2+trailerMD.Len())
+	if trailerOnly {
+		headerFields = append(headerFields, hpack.HeaderField{Name: ":status", Value: "200"})
+		headerFields = append(headerFields, hpack.HeaderField{Name: "content-type", Value: grpcutil.ContentType(op.contentSubtype)})
+	}
+	headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-status", Value: strconv.Itoa(int(op.status.Code()))})
+	headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-message", Value: encodeGrpcMessage(op.status.Message())})
+
+	if p := istatus.RawStatusProto(op.status); len(p.GetDetails()) > 0 {
+		delete(trailerMD, grpcStatusDetailsBinHeader)
+		stBytes, err := proto.Marshal(p)
+		if err != nil {
+			t.logger.Errorf("Failed to marshal rpc status: %s, error: %v", pretty.ToJSON(p), err)
+		} else {
+			headerFields = append(headerFields, hpack.HeaderField{Name: grpcStatusDetailsBinHeader, Value: encodeBinHeader(stBytes)})
+		}
+	}
+
+	return appendHeaderFieldsFromMD(headerFields, trailerMD)
+}
+
+func (t *http2Server) writeKomaPrivateHeaders(fr *http2.Framer, streamID uint32, endStream bool, fields []hpack.HeaderField) error {
+	t.hBuf.Reset()
+	for _, f := range fields {
+		if err := t.hEnc.WriteField(f); err != nil {
+			if t.logger.V(logLevel) {
+				t.logger.Warningf("Encountered error while encoding headers: %v", err)
+			}
+			return err
+		}
+	}
+
+	var endHeaders bool
+	first := true
+	for !endHeaders {
+		size := t.hBuf.Len()
+		if size > http2MaxFrameLen {
+			size = http2MaxFrameLen
+		} else {
+			endHeaders = true
+		}
+		fragment := t.hBuf.Next(size)
+		if first {
+			first = false
+			if err := fr.WriteHeaders(http2.HeadersFrameParam{
+				StreamID:      streamID,
+				BlockFragment: fragment,
+				EndStream:     endStream,
+				EndHeaders:    endHeaders,
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := fr.WriteContinuation(streamID, endHeaders, fragment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *http2Server) writeKomaPrivateData(fr *http2.Framer, streamID uint32, hdr []byte, data mem.BufferSlice) error {
+	payloadLen := len(hdr) + data.Len()
+	if payloadLen == 0 {
+		return fr.WriteData(streamID, false, nil)
+	}
+
+	pool := t.bufferPool
+	if pool == nil {
+		pool = mem.DefaultBufferPool()
+	}
+	buf := pool.Get(payloadLen)
+	defer pool.Put(buf)
+	payload := (*buf)[:payloadLen]
+	copy(payload, hdr)
+	data.CopyTo(payload[len(hdr):])
+
+	for len(payload) > 0 {
+		size := len(payload)
+		if size > http2MaxFrameLen {
+			size = http2MaxFrameLen
+		}
+		if err := fr.WriteData(streamID, false, payload[:size]); err != nil {
+			return err
+		}
+		payload = payload[size:]
+	}
+	return nil
+}
+
+func (t *http2Server) writeKomaReplyBuffer(op *komaTxOp, b []byte) error {
+	kw := t.framer.komaWriter()
+	if kw == nil || kw.KomaSocket == nil {
+		return errors.New("transport: missing KOMA writer")
+	}
+	cw, ok := kw.KomaSocket.(komaReplyCookieWriter)
+	if !ok {
+		return errors.New("transport: KOMA writer cannot send reply cookies")
+	}
+
+	n, err := cw.WriteWithReplyCookie(b, op.replyHandle, op.replyFlags)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
+	}
+	t.debugKomaRecordFrame("unary-response", op.streamID, op.replyHandle, op.replyFlags, len(b), err)
+	return err
+}
+
+func (t *http2Server) finishKomaStreamAfterTx(s *ServerStream, rst bool, rstCode http2.ErrCode, eosReceived bool) error {
+	if s == nil {
+		return nil
+	}
+	s.cancel()
+	oldState := s.swapState(streamDone)
+	if oldState == streamDone {
+		return nil
+	}
+	if rst {
+		if err := t.processCleanupStreamDirect(s.id, rstCode, s.KomaReplyHandle); err != nil {
+			return err
+		}
+	}
+	t.deleteStream(s, eosReceived)
+	return nil
+}
+
+func (t *http2Server) emitKomaOutHeaderStats(op *komaTxOp) {
+	if op.stream == nil {
+		return
+	}
+	for _, sh := range t.stats {
+		sh.HandleRPC(op.stream.Context(), &stats.OutHeader{
+			Header:      op.headerMD.Copy(),
+			Compression: op.sendCompress,
+		})
+	}
+}
+
+func (t *http2Server) emitKomaOutTrailerStats(op *komaTxOp, trailerMD metadata.MD) {
+	if op.stream == nil {
+		return
+	}
+	for _, sh := range t.stats {
+		sh.HandleRPC(op.stream.Context(), &stats.OutTrailer{
+			Trailer: trailerMD.Copy(),
+		})
 	}
 }
 
@@ -1613,13 +1865,34 @@ func (t *http2Server) streamContextErr(s *ServerStream) error {
 // WriteHeader sends the header metadata md back to the client.
 func (t *http2Server) writeHeader(s *ServerStream, md metadata.MD) error {
 	if t.komaAsyncTX {
-		return t.queueKomaTx(&komaTxOp{
-			kind:   komaTxWriteHeader,
-			stream: s,
-			md:     md,
-		})
+		return t.stageKomaUnaryHeader(s, md)
 	}
 	return t.writeHeaderDirect(s, md)
+}
+
+func (t *http2Server) stageKomaUnaryHeader(s *ServerStream, md metadata.MD) error {
+	s.hdrMu.Lock()
+	defer s.hdrMu.Unlock()
+	mdLen := 0
+	if md != nil {
+		mdLen = md.Len()
+	}
+	debugKomaTxf("stage-unary-header stream=%d reply_handle=%d header_sent_before=%t state=%v md_len=%d",
+		s.id, s.KomaReplyHandle, s.isHeaderSent(), s.getState(), mdLen)
+	if s.getState() == streamDone {
+		return t.streamContextErr(s)
+	}
+	if s.updateHeaderSent() {
+		return ErrIllegalHeaderWrite
+	}
+	if md.Len() > 0 {
+		if s.header.Len() > 0 {
+			s.header = metadata.Join(s.header, md)
+		} else {
+			s.header = md
+		}
+	}
+	return nil
 }
 
 func (t *http2Server) writeHeaderDirect(s *ServerStream, md metadata.MD) error {
@@ -1802,13 +2075,55 @@ func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
 // OK is adopted.
 func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 	if t.komaAsyncTX {
-		return t.queueKomaTx(&komaTxOp{
-			kind:   komaTxWriteStatus,
-			stream: s,
-			status: st,
-		})
+		return t.stageKomaUnaryStatus(s, st)
 	}
 	return t.writeStatusDirect(s, st)
+}
+
+func (t *http2Server) stageKomaUnaryStatus(s *ServerStream, st *status.Status) error {
+	s.hdrMu.Lock()
+	if s.getState() == streamDone {
+		s.hdrMu.Unlock()
+		return nil
+	}
+	if s.komaUnaryDone {
+		s.hdrMu.Unlock()
+		err := status.Error(codes.Internal, "transport: duplicate KOMA unary status")
+		fmt.Printf("http2-koma: ERROR duplicate unary status stream=%d reply_handle=%d err=%v\n",
+			s.id, s.KomaReplyHandle, err)
+		return err
+	}
+
+	s.updateHeaderSent()
+	op := &komaTxOp{
+		kind:           komaTxUnaryResponse,
+		stream:         s,
+		streamID:       s.id,
+		hdr:            s.komaUnaryHdr,
+		data:           s.komaUnaryData,
+		dataSet:        s.komaUnaryDataSet,
+		status:         st,
+		headerMD:       s.header.Copy(),
+		trailerMD:      s.trailer.Copy(),
+		replyHandle:    s.KomaReplyHandle,
+		replyFlags:     http2.KomaReplyCookieFlagFinal,
+		contentSubtype: s.contentSubtype,
+		sendCompress:   s.sendCompress,
+	}
+
+	s.komaUnaryHdr = nil
+	s.komaUnaryData = nil
+	s.komaUnaryDataSet = false
+	s.komaUnaryDone = true
+	s.hdrMu.Unlock()
+
+	if err := t.enqueueKomaTx(op); err != nil {
+		if op.dataSet {
+			op.data.Free()
+		}
+		return err
+	}
+	return nil
 }
 
 func (t *http2Server) writeStatusDirect(s *ServerStream, st *status.Status) error {
@@ -1888,16 +2203,34 @@ func (t *http2Server) writeStatusDirect(s *ServerStream, st *status.Status) erro
 // is returns if it fails (e.g., framing error, transport error).
 func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
 	if t.komaAsyncTX {
-		hdrCopy := append([]byte(nil), hdr...)
-		return t.queueKomaTx(&komaTxOp{
-			kind:   komaTxWriteData,
-			stream: s,
-			hdr:    hdrCopy,
-			data:   data,
-			opts:   opts,
-		})
+		return t.stageKomaUnaryData(s, hdr, data, opts)
 	}
 	return t.writeDirect(s, hdr, data, opts)
+}
+
+func (t *http2Server) stageKomaUnaryData(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
+	s.hdrMu.Lock()
+	defer s.hdrMu.Unlock()
+	debugKomaTxf("stage-unary-data stream=%d reply_handle=%d header_sent_before=%t state=%v hdr_bytes=%d data_bytes=%d",
+		s.id, s.KomaReplyHandle, s.isHeaderSent(), s.getState(), len(hdr), data.Len())
+	if s.getState() == streamDone {
+		return t.streamContextErr(s)
+	}
+	if s.komaUnaryDataSet {
+		err := status.Error(codes.Unimplemented, "transport: KOMA async TX supports unary responses only")
+		fmt.Printf("http2-koma: ERROR unsupported streaming response stream=%d reply_handle=%d existing_bytes=%d new_hdr_bytes=%d new_data_bytes=%d err=%v\n",
+			s.id, s.KomaReplyHandle, len(s.komaUnaryHdr)+s.komaUnaryData.Len(), len(hdr), data.Len(), err)
+		return err
+	}
+	if !s.isHeaderSent() {
+		s.updateHeaderSent()
+	}
+
+	data.Ref()
+	s.komaUnaryHdr = append([]byte(nil), hdr...)
+	s.komaUnaryData = data
+	s.komaUnaryDataSet = true
+	return nil
 }
 
 func (t *http2Server) writeDirect(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
@@ -2113,9 +2446,14 @@ func (t *http2Server) Close(err error) {
 		for {
 			select {
 			case op := <-t.komaTxOps:
-				if op != nil && op.done != nil {
+				if op == nil {
+					continue
+				}
+				if op.done != nil {
 					op.done <- ErrConnClosing
 					close(op.done)
+				} else if op.kind == komaTxUnaryResponse && op.dataSet {
+					op.data.Free()
 				}
 			default:
 				goto drained

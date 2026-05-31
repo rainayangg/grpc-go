@@ -51,6 +51,13 @@ type ServerStream struct {
 	hdrMu      sync.Mutex
 	header     metadata.MD // the outgoing header metadata.  Updated by WriteHeader.
 	headerSent atomic.Bool // atomically set when the headers are sent out.
+
+	// KOMA async TX supports unary responses by staging exactly one response
+	// message until WriteStatus provides the final trailers.
+	komaUnaryHdr     []byte
+	komaUnaryData    mem.BufferSlice
+	komaUnaryDataSet bool
+	komaUnaryDone    bool
 }
 
 // Read reads an n byte message from the input stream.
