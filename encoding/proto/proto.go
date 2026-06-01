@@ -77,8 +77,7 @@ func (c *codecV2) Unmarshal(data mem.BufferSlice, v any) (err error) {
 	// TODO: Upgrade proto.Unmarshal to support mem.BufferSlice. Right now, it's not
 	//  really possible without a major overhaul of the proto package, but the
 	//  vtprotobuf library may be able to support this.
-	err = proto.Unmarshal(buf.ReadOnlyData(), vv)
-	return err
+	return proto.Unmarshal(buf.ReadOnlyData(), vv)
 }
 
 func messageV2Of(v any) proto.Message {

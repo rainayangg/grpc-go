@@ -423,6 +423,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		err = connectionErrorf(true, err, "transport: failed to write client preface: %v", err)
 		return nil, err
 	}
+	fmt.Printf("Client: send preface to the server\n")
 	if n != len(clientPreface) {
 		err = connectionErrorf(true, nil, "transport: preface mismatch, wrote %d bytes; want %d", n, len(clientPreface))
 		return nil, err
@@ -1311,9 +1312,6 @@ func (t *http2Client) handleSettings(f *http2.SettingsFrame, isFirst bool) {
 		}
 		return true
 	}, sf)
-	if maxStreams != nil {
-	} else {
-	}
 }
 
 func (t *http2Client) handlePing(f *http2.PingFrame) {
@@ -1538,6 +1536,7 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 			mdata[hf.Name] = append(mdata[hf.Name], v)
 		}
 	}
+
 	if !isGRPC || httpStatusErr != "" {
 		code := codes.Internal // when header does not include HTTP status, return INTERNAL
 
@@ -1629,6 +1628,7 @@ func (t *http2Client) readServerPreface() error {
 	if !ok {
 		return connectionErrorf(true, nil, "initial http2 frame from server is not a settings frame: %T", frame)
 	}
+	fmt.Printf("client receives from the server Settings!\n")
 	t.handleSettings(sf, true)
 	return nil
 }
