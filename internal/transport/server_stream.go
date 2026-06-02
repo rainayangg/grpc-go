@@ -47,6 +47,8 @@ type ServerStream struct {
 	headerWireLength            int
 	Mark                        uint32
 	KomaFrom                    unix.Sockaddr
+	komaDoneNext                atomic.Pointer[ServerStream]
+	komaResp                    *komaUnaryResponse
 
 	// hdrMu protects outgoing header and trailer metadata.
 	hdrMu      sync.Mutex
@@ -77,6 +79,13 @@ func (s *ServerStream) Write(hdr []byte, data mem.BufferSlice, opts *WriteOption
 // the final call made on a stream and always occurs.
 func (s *ServerStream) WriteStatus(st *status.Status) error {
 	return s.st.writeStatus(s, st)
+}
+
+func (s *ServerStream) komaResponse() *komaUnaryResponse {
+	if s.komaResp == nil {
+		s.komaResp = &komaUnaryResponse{}
+	}
+	return s.komaResp
 }
 
 // isHeaderSent indicates whether headers have been sent.
