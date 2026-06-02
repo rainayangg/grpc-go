@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -45,6 +46,7 @@ type ServerStream struct {
 	clientAdvertisedCompressors string
 	headerWireLength            int
 	Mark                        uint32
+	KomaFrom                    unix.Sockaddr
 
 	// hdrMu protects outgoing header and trailer metadata.
 	hdrMu      sync.Mutex

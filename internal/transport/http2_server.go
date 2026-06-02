@@ -45,7 +45,7 @@ import (
 	// "google.golang.org/grpc/timetrace"
 	"google.golang.org/protobuf/proto"
 
-	// "golang.org/x/sys/unix"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal/channelz"
@@ -402,7 +402,7 @@ func (t *http2Server) processCleanupStream(streamID uint32, rstCode http2.ErrCod
 
 // operateHeadersKoma takes action on the decoded headers. Returns an error if fatal
 // error encountered and transport needs to close, otherwise returns nil.
-func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame) (*ServerStream, error) {
+func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaHeadersFrame, from unix.Sockaddr) (*ServerStream, error) {
 	streamID := frame.Header().StreamID
 	if frame.Truncated {
 		t.processCleanupStream(streamID, http2.ErrCodeFrameSize)
@@ -417,6 +417,7 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		},
 		st:               t,
 		headerWireLength: int(frame.Header().Length),
+		KomaFrom:         from,
 	}
 	var (
 		// if false, content-type was missing or invalid
@@ -933,17 +934,10 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		// 	return
 		// }
 
-		frames, err := t.framer.komafr.ReadFrames()
+		frames, replyFrom, err := t.framer.komafr.ReadFrames()
 		// timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
 		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
 		// fmt.Printf("%+v\n", frames)
-
-		if frames == nil || len(frames) == 0 {
-			// fmt.Printf("HandleStreamsKoma: no frames read, continue\n")
-			continue
-		}
-
-		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 
 		if err != nil {
 			if _, ok := err.(http2.StreamError); ok {
@@ -954,6 +948,13 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			t.Close(err)
 			return
 		}
+
+		if frames == nil || len(frames) == 0 {
+			// fmt.Printf("HandleStreamsKoma: no frames read, continue\n")
+			continue
+		}
+
+		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
 		// fmt.Printf("HandleStreamsKoma: start processing frames\n")
 		var stream *ServerStream
@@ -962,7 +963,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			switch frame := frame.(type) {
 			case *http2.MetaHeadersFrame:
 				ifNewStream = true
-				s, err := t.operateHeadersKoma(ctx, frame)
+				s, err := t.operateHeadersKoma(ctx, frame, replyFrom)
 				if err != nil {
 					continue
 				}
