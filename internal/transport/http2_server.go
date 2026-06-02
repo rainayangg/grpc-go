@@ -1876,24 +1876,25 @@ func (t *http2Server) encodeAndSendKomaResponse(s *ServerStream) error {
 }
 
 func (t *http2Server) writeKomaDataFrame(streamID uint32, df komaDataFrame) error {
-	if len(df.h) == 0 && df.data.Len() == 0 {
+	hSize := len(df.h)
+	dSize := df.data.Len()
+	if hSize == 0 && dSize == 0 {
 		return t.framer.komafr.WriteData(streamID, false, nil)
 	}
-	if len(df.h) > 0 {
-		if err := t.framer.komafr.WriteData(streamID, false, df.h); err != nil {
-			return err
-		}
+	if dSize == 0 {
+		return t.framer.komafr.WriteData(streamID, false, df.h)
 	}
-	for _, b := range df.data {
-		payload := b.ReadOnlyData()
-		if len(payload) == 0 {
-			continue
-		}
-		if err := t.framer.komafr.WriteData(streamID, false, payload); err != nil {
-			return err
-		}
+
+	payloadSize := hSize + dSize
+	pool := t.bufferPool
+	if pool == nil {
+		pool = mem.DefaultBufferPool()
 	}
-	return nil
+	buf := pool.Get(payloadSize)
+	defer pool.Put(buf)
+	copy((*buf)[:hSize], df.h)
+	df.data.CopyTo((*buf)[hSize:payloadSize])
+	return t.framer.komafr.WriteData(streamID, false, (*buf)[:payloadSize])
 }
 
 func (t *http2Server) komaResponseHeaderFrame(s *ServerStream, resp *komaUnaryResponse) *headerFrame {
