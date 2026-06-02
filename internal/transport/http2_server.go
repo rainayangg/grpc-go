@@ -1054,8 +1054,11 @@ func (t *http2Server) updateFlowControl(n uint32) {
 func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 	size := f.Header().Length
 	if size > 0 {
-		if len(f.Data()) > 0 {
-			s.write(recvMsg{buffer: &mem.KomaBuffer{Data: f.Data()}})
+		data := f.Data()
+		if len(data) > 0 {
+			owned := make([]byte, len(data))
+			copy(owned, data)
+			s.write(recvMsg{buffer: &mem.KomaBuffer{Data: owned}})
 		}
 	}
 	if f.StreamEnded() {
