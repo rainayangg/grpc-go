@@ -74,6 +74,8 @@ var serverConnectionCounter uint64
 
 var komaDoneEventFDWake = [8]byte{1}
 
+const komaTxThrottleLimit = 1
+
 type komaDataFrame struct {
 	h    []byte
 	data mem.BufferSlice
@@ -164,10 +166,13 @@ type http2Server struct {
 	hBuf *bytes.Buffer  // The buffer for HPACK encoding.
 	hEnc *hpack.Encoder // HPACK encoder.
 
-	ifkoma          bool
-	komaDoneHead    atomic.Pointer[ServerStream]
-	komaDoneEventFD int
-	komaTxCh        chan *ServerStream
+	ifkoma            bool
+	komaDoneHead      atomic.Pointer[ServerStream]
+	komaDoneEventFD   int
+	komaTxCh          chan *ServerStream
+	komaTxMu          sync.Mutex
+	komaTxOutstanding int
+	komaTxThrottleCh  chan struct{}
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -964,6 +969,10 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 	koma.KomaPull(komafd)
 	for {
 		handlerSlots <- struct{}{}
+		if !t.komaTxThrottle() {
+			<-handlerSlots
+			return
+		}
 
 		n, err := unix.EpollWait(epfd, events, -1)
 		if err == unix.EINTR {
@@ -1057,13 +1066,54 @@ func (t *http2Server) runKomaTXLoop(ch <-chan *ServerStream) {
 			if !ok {
 				return
 			}
-			if err := t.encodeAndSendKomaResponse(s); err != nil {
+			err := t.encodeAndSendKomaResponse(s)
+			t.komaTxSent()
+			if err != nil {
 				t.Close(err)
 				return
 			}
 		case <-t.done:
 			return
 		}
+	}
+}
+
+func (t *http2Server) komaTxThrottle() bool {
+	for {
+		t.komaTxMu.Lock()
+		ch := t.komaTxThrottleCh
+		t.komaTxMu.Unlock()
+		if ch == nil {
+			return true
+		}
+		select {
+		case <-ch:
+		case <-t.done:
+			return false
+		}
+	}
+}
+
+func (t *http2Server) komaTxQueued() {
+	t.komaTxMu.Lock()
+	defer t.komaTxMu.Unlock()
+
+	t.komaTxOutstanding++
+	if t.komaTxOutstanding >= komaTxThrottleLimit && t.komaTxThrottleCh == nil {
+		t.komaTxThrottleCh = make(chan struct{})
+	}
+}
+
+func (t *http2Server) komaTxSent() {
+	t.komaTxMu.Lock()
+	defer t.komaTxMu.Unlock()
+
+	if t.komaTxOutstanding > 0 {
+		t.komaTxOutstanding--
+	}
+	if t.komaTxOutstanding < komaTxThrottleLimit && t.komaTxThrottleCh != nil {
+		close(t.komaTxThrottleCh)
+		t.komaTxThrottleCh = nil
 	}
 }
 
@@ -1816,10 +1866,12 @@ func (t *http2Server) Close(err error) {
 
 func (t *http2Server) publishKomaDone(s *ServerStream) error {
 	if t.komaTxCh != nil {
+		t.komaTxQueued()
 		select {
 		case t.komaTxCh <- s:
 			return nil
 		case <-t.done:
+			t.komaTxSent()
 			return ErrConnClosing
 		}
 	}
