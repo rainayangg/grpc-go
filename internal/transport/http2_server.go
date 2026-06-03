@@ -1054,7 +1054,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
 		// the associated stream (which involves blocking and waiting), ii) assign a go-routine worker to do the associated work.
 		if ifNewStream {
-			go handle(stream)
+			// go handle(stream)
+			handle(stream)
 		}
 
 	}
