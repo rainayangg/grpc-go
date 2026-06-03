@@ -167,6 +167,7 @@ type http2Server struct {
 	ifkoma          bool
 	komaDoneHead    atomic.Pointer[ServerStream]
 	komaDoneEventFD int
+	komaTxCh        chan *ServerStream
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -292,11 +293,9 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 	}
 	var buf bytes.Buffer // from loopyWriter
 	komaDoneEventFD := -1
+	var komaTxCh chan *ServerStream
 	if ifkoma {
-		komaDoneEventFD, err = unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
-		if err != nil {
-			return nil, connectionErrorf(false, err, "transport: failed to create KOMA done eventfd: %v", err)
-		}
+		komaTxCh = make(chan *ServerStream, 1024)
 	}
 	t := &http2Server{
 		done:              done,
@@ -320,6 +319,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		hEnc:              hpack.NewEncoder(&buf),
 		ifkoma:            ifkoma,
 		komaDoneEventFD:   komaDoneEventFD,
+		komaTxCh:          komaTxCh,
 	}
 	var czSecurity credentials.ChannelzSecurityValue
 	if au, ok := authInfo.(credentials.ChannelzSecurityInfo); ok {
@@ -955,14 +955,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		t.Close(fmt.Errorf("epoll add koma fd=%d: %w", komafd, err))
 		return
 	}
-	if t.komaDoneEventFD >= 0 {
-		if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, t.komaDoneEventFD, &unix.EpollEvent{
-			Events: unix.EPOLLIN,
-			Fd:     int32(t.komaDoneEventFD),
-		}); err != nil {
-			t.Close(fmt.Errorf("epoll add koma done eventfd=%d: %w", t.komaDoneEventFD, err))
-			return
-		}
+	if t.komaTxCh != nil {
+		go t.runKomaTXLoop(t.komaTxCh)
 	}
 	events := make([]unix.EpollEvent, 16)
 	handlerSlots := make(chan struct{}, 1)
@@ -982,26 +976,10 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		}
 
 		rxReady := false
-		doneReady := false
 		for i := 0; i < n; i++ {
 			fd := int(events[i].Fd)
 			if fd == komafd {
 				rxReady = true
-			}
-			if fd == t.komaDoneEventFD {
-				doneReady = true
-			}
-		}
-
-		if doneReady {
-			done, err := t.takeKomaDoneListAfterWake()
-			if err != nil {
-				t.Close(err)
-				return
-			}
-			if err := t.drainKomaDoneList(done); err != nil {
-				t.Close(err)
-				return
 			}
 		}
 		if !rxReady {
@@ -1069,6 +1047,23 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			<-handlerSlots
 		}
 
+	}
+}
+
+func (t *http2Server) runKomaTXLoop(ch <-chan *ServerStream) {
+	for {
+		select {
+		case s, ok := <-ch:
+			if !ok {
+				return
+			}
+			if err := t.encodeAndSendKomaResponse(s); err != nil {
+				t.Close(err)
+				return
+			}
+		case <-t.done:
+			return
+		}
 	}
 }
 
@@ -1820,6 +1815,15 @@ func (t *http2Server) Close(err error) {
 }
 
 func (t *http2Server) publishKomaDone(s *ServerStream) error {
+	if t.komaTxCh != nil {
+		select {
+		case t.komaTxCh <- s:
+			return nil
+		case <-t.done:
+			return ErrConnClosing
+		}
+	}
+
 	for {
 		head := t.komaDoneHead.Load()
 		s.komaDoneNext.Store(head)
