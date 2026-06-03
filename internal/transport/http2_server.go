@@ -964,19 +964,15 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		go t.runKomaTXLoop(t.komaTxCh)
 	}
 	events := make([]unix.EpollEvent, 16)
-	handlerSlots := make(chan struct{}, 1)
 
 	koma.KomaPull(komafd)
 	for {
-		handlerSlots <- struct{}{}
 		if !t.komaTxThrottle() {
-			<-handlerSlots
 			return
 		}
 
 		n, err := unix.EpollWait(epfd, events, -1)
 		if err == unix.EINTR {
-			<-handlerSlots
 			continue
 		}
 		if err != nil {
@@ -992,7 +988,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			}
 		}
 		if !rxReady {
-			<-handlerSlots
 			continue
 		}
 
@@ -1005,7 +1000,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			if _, ok := err.(http2.StreamError); ok {
 				fmt.Printf("Write RST stream for %d", frames[0].Header().StreamID)
 				t.framer.komafr.WriteRSTStream(frames[0].Header().StreamID, err.(http2.StreamError).Code)
-				<-handlerSlots
 				continue
 			}
 			t.Close(err)
@@ -1014,7 +1008,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 
 		if frames == nil || len(frames) == 0 {
 			// fmt.Printf("HandleStreamsKoma: no frames read, continue\n")
-			<-handlerSlots
 			continue
 		}
 
@@ -1049,11 +1042,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		// the associated stream (which involves blocking and waiting), ii) assign a go-routine worker to do the associated work.
 		if ifNewStream {
 			go func(stream *ServerStream) {
-				defer func() { <-handlerSlots }()
 				handle(stream)
 			}(stream)
-		} else {
-			<-handlerSlots
 		}
 
 	}
