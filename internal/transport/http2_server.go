@@ -74,7 +74,7 @@ var serverConnectionCounter uint64
 
 var komaDoneEventFDWake = [8]byte{1}
 
-const komaTxThrottleLimit = 1
+const komaTxThrottleLimit = 10
 
 type komaDataFrame struct {
 	h    []byte
