@@ -80,8 +80,9 @@ var komaDoneEventFDWake = [8]byte{1}
 var komaDebugStatsEnabled = os.Getenv("GRPC_KOMA_DEBUG_STATS") != ""
 
 const (
-	komaTxThrottleLimit  = 10
-	komaDebugHistBuckets = 65
+	komaTxThrottleLimit     = 10
+	komaHandlerWorkersPerFD = 1
+	komaDebugHistBuckets    = 65
 )
 
 type komaDataFrame struct {
@@ -110,12 +111,19 @@ type komaDebugHist struct {
 	buckets [komaDebugHistBuckets]uint64
 }
 
+type komaHandlerWork struct {
+	stream     *ServerStream
+	dispatchAt time.Time
+}
+
 type komaDebugStats struct {
 	startNs uint64
 
 	rxDatagrams     uint64
 	rxFrames        uint64
 	handlersSpawned uint64
+	handlersWorker  uint64
+	handlersGo      uint64
 	txQueued        uint64
 	txSent          uint64
 
@@ -233,7 +241,7 @@ func (t *http2Server) dumpKomaStats(workerID int, komafd int) {
 	}
 
 	fmt.Fprintf(os.Stderr,
-		"KOMA_STATS_EXIT worker=%d fd=%d runtime_ms=%d gor=%d tx_limit=%d rx=%d frames=%d handlers=%d txq=%d txs=%d out=%d ch=%d out_max=%d ch_max=%d\n",
+		"KOMA_STATS_EXIT worker=%d fd=%d runtime_ms=%d gor=%d tx_limit=%d rx=%d frames=%d handlers=%d handler_worker=%d handler_go=%d txq=%d txs=%d out=%d ch=%d out_max=%d ch_max=%d\n",
 		workerID,
 		komafd,
 		runtimeMs,
@@ -242,6 +250,8 @@ func (t *http2Server) dumpKomaStats(workerID int, komafd int) {
 		atomic.LoadUint64(&stats.rxDatagrams),
 		atomic.LoadUint64(&stats.rxFrames),
 		atomic.LoadUint64(&stats.handlersSpawned),
+		atomic.LoadUint64(&stats.handlersWorker),
+		atomic.LoadUint64(&stats.handlersGo),
 		atomic.LoadUint64(&stats.txQueued),
 		atomic.LoadUint64(&stats.txSent),
 		outstanding,
@@ -1119,6 +1129,24 @@ func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStre
 	}
 }
 
+func (t *http2Server) runKomaHandlerWorker(ch <-chan komaHandlerWork, handle func(*ServerStream)) {
+	for {
+		select {
+		case work := <-ch:
+			if komaDebugStatsEnabled {
+				start := time.Now()
+				t.komaStats.handlerSched.record(start.Sub(work.dispatchAt))
+				handle(work.stream)
+				t.komaStats.handlerRun.record(time.Since(start))
+				continue
+			}
+			handle(work.stream)
+		case <-t.done:
+			return
+		}
+	}
+}
+
 // HandleStreamsKoma receives incoming streams. The difference from the default one is that we do not give them to any handler directly. Instead, the handler function is called directly in serverWorker().
 func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerID int, handle func(*ServerStream)) {
 	defer close(t.readerDone)
@@ -1145,6 +1173,10 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 	}
 	if t.komaTxCh != nil {
 		go t.runKomaTXLoop(t.komaTxCh)
+	}
+	handlerCh := make(chan komaHandlerWork)
+	for i := 0; i < komaHandlerWorkersPerFD; i++ {
+		go t.runKomaHandlerWorker(handlerCh, handle)
 	}
 	events := make([]unix.EpollEvent, 16)
 
@@ -1251,21 +1283,33 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
 		// the associated stream (which involves blocking and waiting), ii) assign a go-routine worker to do the associated work.
 		if ifNewStream {
+			work := komaHandlerWork{stream: stream}
 			if komaDebugStatsEnabled {
-				spawnAt := time.Now()
+				work.dispatchAt = time.Now()
 				atomic.AddUint64(&t.komaStats.handlersSpawned, 1)
-				go func(stream *ServerStream) {
-					start := time.Now()
-					t.komaStats.handlerSched.record(start.Sub(spawnAt))
-					handle(stream)
-					t.komaStats.handlerRun.record(time.Since(start))
-				}(stream)
-			} else {
+			}
+			select {
+			case handlerCh <- work:
+				if komaDebugStatsEnabled {
+					atomic.AddUint64(&t.komaStats.handlersWorker, 1)
+				}
+			case <-t.done:
+				return
+			default:
+				if komaDebugStatsEnabled {
+					atomic.AddUint64(&t.komaStats.handlersGo, 1)
+					go func(work komaHandlerWork) {
+						start := time.Now()
+						t.komaStats.handlerSched.record(start.Sub(work.dispatchAt))
+						handle(work.stream)
+						t.komaStats.handlerRun.record(time.Since(start))
+					}(work)
+					continue
+				}
 				go func(stream *ServerStream) {
 					handle(stream)
 				}(stream)
 			}
-			runtime.Gosched()
 		}
 
 	}
