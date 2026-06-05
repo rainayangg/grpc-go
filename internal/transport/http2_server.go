@@ -1148,7 +1148,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 	}
 	events := make([]unix.EpollEvent, 16)
 
-	koma.KomaPull(komafd)
 	for {
 		if komaDebugStatsEnabled {
 			start := time.Now()
@@ -1160,6 +1159,8 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 		} else if !t.komaTxThrottle() {
 			return
 		}
+
+		koma.KomaPull(komafd)
 
 		var n int
 		if komaDebugStatsEnabled {
