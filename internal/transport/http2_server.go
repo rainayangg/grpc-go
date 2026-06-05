@@ -258,6 +258,20 @@ func (t *http2Server) dumpKomaStats(workerID int, komafd int) {
 	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("tx_send", &stats.txSend))
 }
 
+func (t *http2Server) dumpKomaStatsOnce() {
+	if !komaDebugStatsEnabled || !t.ifkoma {
+		return
+	}
+	t.komaStatsDumpOnce.Do(func() {
+		workerID := int(atomic.LoadInt64(&t.komaDebugWorkerID))
+		komafd := int(atomic.LoadInt64(&t.komaDebugFD))
+		if workerID < 0 || komafd < 0 {
+			return
+		}
+		t.dumpKomaStats(workerID, komafd)
+	})
+}
+
 // http2Server implements the ServerTransport interface with HTTP2.
 type http2Server struct {
 	lastRead        int64 // Keep this field 64-bit aligned. Accessed atomically.
@@ -334,6 +348,9 @@ type http2Server struct {
 	komaTxOutstanding int
 	komaTxThrottleCh  chan struct{}
 	komaStats         komaDebugStats
+	komaDebugWorkerID int64
+	komaDebugFD       int64
+	komaStatsDumpOnce sync.Once
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -486,6 +503,8 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 		ifkoma:            ifkoma,
 		komaDoneEventFD:   komaDoneEventFD,
 		komaTxCh:          komaTxCh,
+		komaDebugWorkerID: -1,
+		komaDebugFD:       -1,
 	}
 	var czSecurity credentials.ChannelzSecurityValue
 	if au, ok := authInfo.(credentials.ChannelzSecurityInfo); ok {
@@ -1104,8 +1123,10 @@ func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStre
 func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerID int, handle func(*ServerStream)) {
 	defer close(t.readerDone)
 	if komaDebugStatsEnabled {
+		atomic.StoreInt64(&t.komaDebugWorkerID, int64(workerID))
+		atomic.StoreInt64(&t.komaDebugFD, int64(komafd))
 		atomic.StoreUint64(&t.komaStats.startNs, uint64(time.Now().UnixNano()))
-		defer t.dumpKomaStats(workerID, komafd)
+		defer t.dumpKomaStatsOnce()
 	}
 
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
@@ -2050,6 +2071,9 @@ func (t *http2Server) Close(err error) {
 	streams := t.activeStreams
 	t.activeStreams = nil
 	t.mu.Unlock()
+	if komaDebugStatsEnabled {
+		t.dumpKomaStatsOnce()
+	}
 	if t.controlBuf != nil {
 		t.controlBuf.finish()
 	}
