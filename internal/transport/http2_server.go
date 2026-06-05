@@ -1265,6 +1265,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 					handle(stream)
 				}(stream)
 			}
+			runtime.Gosched()
 		}
 
 	}
