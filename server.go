@@ -158,6 +158,8 @@ type Server struct {
 	serverWorkerChannel      chan func()
 	serverWorkerChannelClose func()
 	komafds                  []int // all koma sockets belonging to this server
+	komaTransports           []transport.ServerTransport
+	komaWorkersWG            sync.WaitGroup
 	komaEnabled              bool  // whether koma is enabled (set via GRPC_KOMA_CORES env var)
 	komaCores                []int // CPU cores for koma workers
 }
@@ -660,6 +662,7 @@ func PinThreadToCPU(cpuID int) error {
 //
 // [1] https://github.com/golang/go/issues/18138
 func (s *Server) serverWorker(workerID int, cpuID int) {
+	defer s.komaWorkersWG.Done()
 	fmt.Printf("worker %d (unpinned, cpuID hint %d)\n", workerID, cpuID)
 
 	komafd := koma.KomaInit()
@@ -673,6 +676,9 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 	// create a dedicated new transport for the koma connection, note that it is
 	// different from the serverTransport of a normal TCP connection
 	st := s.newHTTP2Transport(komaConn, true)
+	s.mu.Lock()
+	s.komaTransports = append(s.komaTransports, st)
+	s.mu.Unlock()
 
 	fmt.Printf("create a new HTTP transport for KOMA socket %d\n", komafd)
 	ctx := transport.SetConnection(context.Background(), komaConn)
@@ -691,7 +697,7 @@ func (s *Server) serverWorker(workerID int, cpuID int) {
 	}()
 
 	// streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
-	st.HandleStreamsKoma(ctx, int(komafd), func(stream *transport.ServerStream) {
+	st.HandleStreamsKoma(ctx, int(komafd), workerID, func(stream *transport.ServerStream) {
 		// fmt.Printf("HandleStreamsKoma: start handling stream!!!\n")
 		// s.handlersWG.Add(1)
 		// streamQuota.acquire()
@@ -710,6 +716,7 @@ func (s *Server) initServerWorkers() {
 		close(s.serverWorkerChannel)
 	})
 	for i := 0; i < int(s.opts.numServerWorkers); i++ {
+		s.komaWorkersWG.Add(1)
 		go s.serverWorker(i, s.komaCores[i%len(s.komaCores)])
 	}
 }
@@ -2102,13 +2109,23 @@ func (s *Server) stop(graceful bool) {
 	s.serveWG.Wait()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if graceful {
 		s.drainAllServerTransportsLocked()
 	} else {
 		s.closeServerTransportsLocked()
 	}
+	komaTransports := append([]transport.ServerTransport(nil), s.komaTransports...)
+	s.komaTransports = nil
+	s.mu.Unlock()
+
+	for _, st := range komaTransports {
+		st.Close(errors.New("server stopped"))
+	}
+	s.komaWorkersWG.Wait()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	for len(s.conns) != 0 {
 		s.cv.Wait()

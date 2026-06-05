@@ -25,9 +25,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	rand "math/rand/v2"
 	"net"
 	"net/http"
+	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -74,7 +77,12 @@ var serverConnectionCounter uint64
 
 var komaDoneEventFDWake = [8]byte{1}
 
-const komaTxThrottleLimit = 10
+var komaDebugStatsEnabled = os.Getenv("GRPC_KOMA_DEBUG_STATS") != ""
+
+const (
+	komaTxThrottleLimit  = 10
+	komaDebugHistBuckets = 65
+)
 
 type komaDataFrame struct {
 	h    []byte
@@ -96,6 +104,158 @@ func (r *komaUnaryResponse) freeDataFrames() {
 		r.dataFrames[i].data.Free()
 		r.dataFrames[i].data = nil
 	}
+}
+
+type komaDebugHist struct {
+	buckets [komaDebugHistBuckets]uint64
+}
+
+type komaDebugStats struct {
+	startNs uint64
+
+	rxDatagrams     uint64
+	rxFrames        uint64
+	handlersSpawned uint64
+	txQueued        uint64
+	txSent          uint64
+
+	txOutstandingMax uint64
+	txChLenMax       uint64
+
+	throttleWait komaDebugHist
+	epollWait    komaDebugHist
+	readFrames   komaDebugHist
+	handlerSched komaDebugHist
+	handlerRun   komaDebugHist
+	txEnqueue    komaDebugHist
+	txSend       komaDebugHist
+}
+
+func (h *komaDebugHist) record(d time.Duration) {
+	if d < 0 {
+		return
+	}
+	ns := uint64(d)
+	bucket := bits.Len64(ns)
+	if bucket >= len(h.buckets) {
+		bucket = len(h.buckets) - 1
+	}
+	atomic.AddUint64(&h.buckets[bucket], 1)
+}
+
+func atomicMaxUint64(addr *uint64, v uint64) {
+	for {
+		old := atomic.LoadUint64(addr)
+		if v <= old {
+			return
+		}
+		if atomic.CompareAndSwapUint64(addr, old, v) {
+			return
+		}
+	}
+}
+
+func komaDebugBucketUpperNs(bucket int) uint64 {
+	if bucket <= 0 {
+		return 0
+	}
+	if bucket >= 64 {
+		return ^uint64(0)
+	}
+	return (uint64(1) << uint(bucket)) - 1
+}
+
+func komaDebugHistSnapshot(h *komaDebugHist) ([komaDebugHistBuckets]uint64, uint64) {
+	var snap [komaDebugHistBuckets]uint64
+	var count uint64
+	for i := range h.buckets {
+		snap[i] = atomic.LoadUint64(&h.buckets[i])
+		count += snap[i]
+	}
+	return snap, count
+}
+
+func komaDebugHistPercentile(snap [komaDebugHistBuckets]uint64, count uint64, pct uint64) uint64 {
+	if count == 0 {
+		return 0
+	}
+	target := (count*pct + 99) / 100
+	if target == 0 {
+		target = 1
+	}
+	var seen uint64
+	for bucket, n := range snap {
+		seen += n
+		if seen >= target {
+			return komaDebugBucketUpperNs(bucket)
+		}
+	}
+	return komaDebugBucketUpperNs(len(snap) - 1)
+}
+
+func komaDebugHistMax(snap [komaDebugHistBuckets]uint64) uint64 {
+	for bucket := len(snap) - 1; bucket >= 0; bucket-- {
+		if snap[bucket] != 0 {
+			return komaDebugBucketUpperNs(bucket)
+		}
+	}
+	return 0
+}
+
+func komaDebugHistSummary(name string, h *komaDebugHist) string {
+	snap, count := komaDebugHistSnapshot(h)
+	return fmt.Sprintf(
+		"%s count=%d p50_us=%.3f p90_us=%.3f p99_us=%.3f max_us=%.3f",
+		name,
+		count,
+		float64(komaDebugHistPercentile(snap, count, 50))/1e3,
+		float64(komaDebugHistPercentile(snap, count, 90))/1e3,
+		float64(komaDebugHistPercentile(snap, count, 99))/1e3,
+		float64(komaDebugHistMax(snap))/1e3,
+	)
+}
+
+func (t *http2Server) dumpKomaStats(workerID int, komafd int) {
+	stats := &t.komaStats
+	startNs := atomic.LoadUint64(&stats.startNs)
+	runtimeMs := uint64(0)
+	if startNs != 0 {
+		runtimeMs = uint64(time.Since(time.Unix(0, int64(startNs))) / time.Millisecond)
+	}
+
+	t.komaTxMu.Lock()
+	outstanding := t.komaTxOutstanding
+	t.komaTxMu.Unlock()
+
+	txChLen := 0
+	if t.komaTxCh != nil {
+		txChLen = len(t.komaTxCh)
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"KOMA_STATS_EXIT worker=%d fd=%d runtime_ms=%d gor=%d tx_limit=%d rx=%d frames=%d handlers=%d txq=%d txs=%d out=%d ch=%d out_max=%d ch_max=%d\n",
+		workerID,
+		komafd,
+		runtimeMs,
+		runtime.NumGoroutine(),
+		komaTxThrottleLimit,
+		atomic.LoadUint64(&stats.rxDatagrams),
+		atomic.LoadUint64(&stats.rxFrames),
+		atomic.LoadUint64(&stats.handlersSpawned),
+		atomic.LoadUint64(&stats.txQueued),
+		atomic.LoadUint64(&stats.txSent),
+		outstanding,
+		txChLen,
+		atomic.LoadUint64(&stats.txOutstandingMax),
+		atomic.LoadUint64(&stats.txChLenMax),
+	)
+	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("throttle", &stats.throttleWait))
+	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("epoll", &stats.epollWait))
+	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("read_frames", &stats.readFrames))
+	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("handler_sched", &stats.handlerSched))
+	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("handler_run", &stats.handlerRun))
+	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("tx_enqueue", &stats.txEnqueue))
+	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("tx_send", &stats.txSend))
 }
 
 // http2Server implements the ServerTransport interface with HTTP2.
@@ -173,6 +333,7 @@ type http2Server struct {
 	komaTxMu          sync.Mutex
 	komaTxOutstanding int
 	komaTxThrottleCh  chan struct{}
+	komaStats         komaDebugStats
 }
 
 // NewServerTransport creates a http2 transport with conn and configuration
@@ -940,11 +1101,12 @@ func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStre
 }
 
 // HandleStreamsKoma receives incoming streams. The difference from the default one is that we do not give them to any handler directly. Instead, the handler function is called directly in serverWorker().
-func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle func(*ServerStream)) {
-	defer func() {
-		close(t.readerDone)
-		<-t.loopyWriterDone
-	}()
+func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerID int, handle func(*ServerStream)) {
+	defer close(t.readerDone)
+	if komaDebugStatsEnabled {
+		atomic.StoreUint64(&t.komaStats.startNs, uint64(time.Now().UnixNano()))
+		defer t.dumpKomaStats(workerID, komafd)
+	}
 
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -967,11 +1129,25 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 
 	koma.KomaPull(komafd)
 	for {
-		if !t.komaTxThrottle() {
+		if komaDebugStatsEnabled {
+			start := time.Now()
+			if !t.komaTxThrottle() {
+				t.komaStats.throttleWait.record(time.Since(start))
+				return
+			}
+			t.komaStats.throttleWait.record(time.Since(start))
+		} else if !t.komaTxThrottle() {
 			return
 		}
 
-		n, err := unix.EpollWait(epfd, events, -1)
+		var n int
+		if komaDebugStatsEnabled {
+			start := time.Now()
+			n, err = unix.EpollWait(epfd, events, -1)
+			t.komaStats.epollWait.record(time.Since(start))
+		} else {
+			n, err = unix.EpollWait(epfd, events, -1)
+		}
 		if err == unix.EINTR {
 			continue
 		}
@@ -991,7 +1167,19 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 			continue
 		}
 
-		frames, replyFrom, err := t.framer.komafr.ReadFrames()
+		var frames []http2.Frame
+		var replyFrom unix.Sockaddr
+		if komaDebugStatsEnabled {
+			start := time.Now()
+			frames, replyFrom, err = t.framer.komafr.ReadFrames()
+			t.komaStats.readFrames.record(time.Since(start))
+			if err == nil {
+				atomic.AddUint64(&t.komaStats.rxDatagrams, 1)
+				atomic.AddUint64(&t.komaStats.rxFrames, uint64(len(frames)))
+			}
+		} else {
+			frames, replyFrom, err = t.framer.komafr.ReadFrames()
+		}
 		// timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
 		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
 		// fmt.Printf("%+v\n", frames)
@@ -1041,9 +1229,20 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, handle 
 		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
 		// the associated stream (which involves blocking and waiting), ii) assign a go-routine worker to do the associated work.
 		if ifNewStream {
-			go func(stream *ServerStream) {
-				handle(stream)
-			}(stream)
+			if komaDebugStatsEnabled {
+				spawnAt := time.Now()
+				atomic.AddUint64(&t.komaStats.handlersSpawned, 1)
+				go func(stream *ServerStream) {
+					start := time.Now()
+					t.komaStats.handlerSched.record(start.Sub(spawnAt))
+					handle(stream)
+					t.komaStats.handlerRun.record(time.Since(start))
+				}(stream)
+			} else {
+				go func(stream *ServerStream) {
+					handle(stream)
+				}(stream)
+			}
 		}
 
 	}
@@ -1055,6 +1254,18 @@ func (t *http2Server) runKomaTXLoop(ch <-chan *ServerStream) {
 		case s, ok := <-ch:
 			if !ok {
 				return
+			}
+			if komaDebugStatsEnabled {
+				start := time.Now()
+				err := t.encodeAndSendKomaResponse(s)
+				t.komaStats.txSend.record(time.Since(start))
+				t.komaTxSent()
+				atomic.AddUint64(&t.komaStats.txSent, 1)
+				if err != nil {
+					t.Close(err)
+					return
+				}
+				continue
 			}
 			err := t.encodeAndSendKomaResponse(s)
 			t.komaTxSent()
@@ -1089,6 +1300,9 @@ func (t *http2Server) komaTxQueued() {
 	defer t.komaTxMu.Unlock()
 
 	t.komaTxOutstanding++
+	if komaDebugStatsEnabled {
+		atomicMaxUint64(&t.komaStats.txOutstandingMax, uint64(t.komaTxOutstanding))
+	}
 	if t.komaTxOutstanding >= komaTxThrottleLimit && t.komaTxThrottleCh == nil {
 		t.komaTxThrottleCh = make(chan struct{})
 	}
@@ -1857,6 +2071,20 @@ func (t *http2Server) Close(err error) {
 func (t *http2Server) publishKomaDone(s *ServerStream) error {
 	if t.komaTxCh != nil {
 		t.komaTxQueued()
+		if komaDebugStatsEnabled {
+			start := time.Now()
+			select {
+			case t.komaTxCh <- s:
+				t.komaStats.txEnqueue.record(time.Since(start))
+				atomic.AddUint64(&t.komaStats.txQueued, 1)
+				atomicMaxUint64(&t.komaStats.txChLenMax, uint64(len(t.komaTxCh)))
+				return nil
+			case <-t.done:
+				t.komaStats.txEnqueue.record(time.Since(start))
+				t.komaTxSent()
+				return ErrConnClosing
+			}
+		}
 		select {
 		case t.komaTxCh <- s:
 			return nil

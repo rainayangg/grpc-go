@@ -546,7 +546,7 @@ type ServerTransport interface {
 	HandleStreams(context.Context, func(*ServerStream))
 
 	// HandleStraems receives incoming streams from Koma socket
-	HandleStreamsKoma(context.Context, int, func(*ServerStream))
+	HandleStreamsKoma(context.Context, int, int, func(*ServerStream))
 
 	// Close tears down the transport. Once it is called, the transport
 	// should not be accessed any more. All the pending streams and their
