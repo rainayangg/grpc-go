@@ -2554,6 +2554,11 @@ func (t *http2Server) Peer() *peer.Peer {
 	}
 }
 
+// Done returns a channel that is closed when the transport shuts down.
+func (t *http2Server) Done() <-chan struct{} {
+	return t.done
+}
+
 func getJitter(v time.Duration) time.Duration {
 	if v == infinity {
 		return 0

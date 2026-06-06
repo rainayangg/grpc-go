@@ -1129,6 +1129,13 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	if !s.addConn(lisAddr, st) {
 		return
 	}
+	if doneTransport, ok := st.(interface{ Done() <-chan struct{} }); ok {
+		done := doneTransport.Done()
+		go func() {
+			<-done
+			s.removeConn(lisAddr, st)
+		}()
+	}
 }
 
 // newHTTP2Transport sets up a http/2 transport (using the
