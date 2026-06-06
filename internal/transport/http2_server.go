@@ -1178,6 +1178,40 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 	for i := 0; i < komaHandlerWorkersPerFD; i++ {
 		go t.runKomaHandlerWorker(handlerCh, handle)
 	}
+	dispatchHandler := func(stream *ServerStream) bool {
+		if stream == nil {
+			return true
+		}
+		work := komaHandlerWork{stream: stream}
+		if komaDebugStatsEnabled {
+			work.dispatchAt = time.Now()
+			atomic.AddUint64(&t.komaStats.handlersSpawned, 1)
+		}
+		select {
+		case handlerCh <- work:
+			if komaDebugStatsEnabled {
+				atomic.AddUint64(&t.komaStats.handlersWorker, 1)
+			}
+			return true
+		case <-t.done:
+			return false
+		default:
+			if komaDebugStatsEnabled {
+				atomic.AddUint64(&t.komaStats.handlersGo, 1)
+				go func(work komaHandlerWork) {
+					start := time.Now()
+					t.komaStats.handlerSched.record(start.Sub(work.dispatchAt))
+					handle(work.stream)
+					t.komaStats.handlerRun.record(time.Since(start))
+				}(work)
+				return true
+			}
+			go func(stream *ServerStream) {
+				handle(stream)
+			}(stream)
+			return true
+		}
+	}
 	events := make([]unix.EpollEvent, 16)
 
 	for {
@@ -1257,16 +1291,17 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
 		// fmt.Printf("HandleStreamsKoma: start processing frames\n")
 		var stream *ServerStream
-		var ifNewStream bool
 		for _, frame := range frames {
 			switch frame := frame.(type) {
 			case *http2.MetaHeadersFrame:
-				ifNewStream = true
 				s, err := t.operateHeadersKoma(ctx, frame, replyFrom)
 				if err != nil {
 					continue
 				}
 				stream = s
+				if !dispatchHandler(stream) {
+					return
+				}
 				// stream.Mark = t.framer.komafr.GetMark()
 			case *http2.DataFrame:
 				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
@@ -1278,40 +1313,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 
 			}
 		}
-		// Rui: finish processing frames of the current stream, call handlestream to do rpc-level processing.
-		// In the original gRPC setting, whenever a new stream is detected (from `MetaHeaderFrame`), the handle function
-		// fed into the `operateHeaders` will run, and either i) spawn a new go routine to call handleStream and process
-		// the associated stream (which involves blocking and waiting), ii) assign a go-routine worker to do the associated work.
-		if ifNewStream {
-			work := komaHandlerWork{stream: stream}
-			if komaDebugStatsEnabled {
-				work.dispatchAt = time.Now()
-				atomic.AddUint64(&t.komaStats.handlersSpawned, 1)
-			}
-			select {
-			case handlerCh <- work:
-				if komaDebugStatsEnabled {
-					atomic.AddUint64(&t.komaStats.handlersWorker, 1)
-				}
-			case <-t.done:
-				return
-			default:
-				if komaDebugStatsEnabled {
-					atomic.AddUint64(&t.komaStats.handlersGo, 1)
-					go func(work komaHandlerWork) {
-						start := time.Now()
-						t.komaStats.handlerSched.record(start.Sub(work.dispatchAt))
-						handle(work.stream)
-						t.komaStats.handlerRun.record(time.Since(start))
-					}(work)
-					continue
-				}
-				go func(stream *ServerStream) {
-					handle(stream)
-				}(stream)
-			}
-		}
-
 	}
 }
 
@@ -1449,6 +1450,9 @@ func (t *http2Server) updateFlowControl(n uint32) {
 }
 
 func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
+	if s == nil {
+		return
+	}
 	size := f.Header().Length
 	if size > 0 {
 		data := f.Data()
@@ -1459,7 +1463,7 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 		}
 	}
 	if f.StreamEnded() {
-		s.state = streamReadDone
+		s.compareAndSwapState(streamActive, streamReadDone)
 		s.write(recvMsg{err: io.EOF})
 	}
 }
