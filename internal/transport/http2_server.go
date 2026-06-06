@@ -80,7 +80,7 @@ var komaDoneEventFDWake = [8]byte{1}
 var komaDebugStatsEnabled = os.Getenv("GRPC_KOMA_DEBUG_STATS") != ""
 
 const (
-	komaTxThrottleLimit  = 5
+	komaTxThrottleLimit  = 10
 	komaRXActorsPerFD    = 2
 	komaDebugHistBuckets = 65
 )
