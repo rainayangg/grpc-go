@@ -401,12 +401,17 @@ func (s *Stream) read(n int) (data mem.BufferSlice, err error) {
 	return data, nil
 }
 
+type streamReader interface {
+	ReadMessageHeader([]byte) (int, error)
+	Read(int) (mem.Buffer, error)
+}
+
 // transportReader reads all the data available for this Stream from the transport and
 // passes them into the decoder, which converts them into a gRPC message stream.
 // The error is io.EOF when the stream is done or another non-nil error if
 // the stream broke.
 type transportReader struct {
-	reader *recvBufferReader
+	reader streamReader
 	// The handler to control the window update procedure for both this
 	// particular stream and the associated transport.
 	windowHandler func(int)
