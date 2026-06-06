@@ -351,6 +351,7 @@ type http2Server struct {
 
 	ifkoma            bool
 	komaDoneHead      atomic.Pointer[ServerStream]
+	komaDoneMu        sync.Mutex
 	komaDoneEventFD   int
 	komaTxCh          chan *ServerStream
 	komaTxMu          sync.Mutex
@@ -1144,11 +1145,35 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 	}
 	defer unix.Close(epfd)
 
+	donefd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		t.Close(fmt.Errorf("eventfd create: %w", err))
+		return
+	}
+	t.komaDoneMu.Lock()
+	t.komaDoneEventFD = donefd
+	t.komaDoneMu.Unlock()
+	defer func() {
+		t.komaDoneMu.Lock()
+		if t.komaDoneEventFD == donefd {
+			t.komaDoneEventFD = -1
+		}
+		unix.Close(donefd)
+		t.komaDoneMu.Unlock()
+	}()
+
 	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, komafd, &unix.EpollEvent{
 		Events: unix.EPOLLIN,
 		Fd:     int32(komafd),
 	}); err != nil {
 		t.Close(fmt.Errorf("epoll add koma fd=%d: %w", komafd, err))
+		return
+	}
+	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, donefd, &unix.EpollEvent{
+		Events: unix.EPOLLIN,
+		Fd:     int32(donefd),
+	}); err != nil {
+		t.Close(fmt.Errorf("epoll add done fd=%d: %w", donefd, err))
 		return
 	}
 	if t.komaTxCh != nil {
@@ -1202,10 +1227,17 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 				}
 
 				rxReady := false
+				doneReady := false
 				for i := 0; i < n; i++ {
 					if int(events[i].Fd) == komafd {
 						rxReady = true
 					}
+					if int(events[i].Fd) == donefd {
+						doneReady = true
+					}
+				}
+				if doneReady {
+					return
 				}
 				if !rxReady {
 					continue
@@ -2113,12 +2145,11 @@ func (t *http2Server) Close(err error) {
 		t.controlBuf.finish()
 	}
 	close(t.done)
+	if err := t.wakeKomaDone(); err != nil && t.logger.V(logLevel) {
+		t.logger.Infof("Error waking KOMA reader during Close: %v", err)
+	}
 	if err := t.conn.Close(); err != nil && t.logger.V(logLevel) {
 		t.logger.Infof("Error closing underlying net.Conn during Close: %v", err)
-	}
-	if t.komaDoneEventFD >= 0 {
-		unix.Close(t.komaDoneEventFD)
-		t.komaDoneEventFD = -1
 	}
 	channelz.RemoveEntry(t.channelz.ID)
 	// Cancel all active streams.
@@ -2298,6 +2329,8 @@ func reverseKomaDoneList(head *ServerStream) *ServerStream {
 }
 
 func (t *http2Server) wakeKomaDone() error {
+	t.komaDoneMu.Lock()
+	defer t.komaDoneMu.Unlock()
 	if t.komaDoneEventFD < 0 {
 		return nil
 	}
@@ -2317,6 +2350,8 @@ func (t *http2Server) wakeKomaDone() error {
 }
 
 func (t *http2Server) drainKomaDoneEvent() error {
+	t.komaDoneMu.Lock()
+	defer t.komaDoneMu.Unlock()
 	if t.komaDoneEventFD < 0 {
 		return nil
 	}
