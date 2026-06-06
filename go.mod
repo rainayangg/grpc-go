@@ -43,4 +43,4 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20250324211829-b45e905df463 // indirect
 )
 
-replace golang.org/x/net => github.com/rainayangg/net-go v0.0.0-20260602013517-039368e40505
+replace golang.org/x/net => github.com/rainayangg/net-go v0.0.0-20260606201807-01c224ad277a
