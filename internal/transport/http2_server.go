@@ -100,72 +100,6 @@ type komaUnaryResponse struct {
 	sendCompress   string
 }
 
-type komaDirectReader struct {
-	ctx     context.Context
-	ctxDone <-chan struct{}
-	data    mem.Buffer
-	err     error
-}
-
-func (r *komaDirectReader) setData(data []byte) {
-	if len(data) != 0 {
-		r.data = &mem.KomaBuffer{Data: data}
-	}
-}
-
-func (r *komaDirectReader) contextErr() error {
-	if r.ctx == nil || r.ctxDone == nil {
-		return nil
-	}
-	select {
-	case <-r.ctxDone:
-		return ContextErr(r.ctx.Err())
-	default:
-		return nil
-	}
-}
-
-func (r *komaDirectReader) ReadMessageHeader(header []byte) (int, error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-	if err := r.contextErr(); err != nil {
-		r.err = err
-		return 0, err
-	}
-	if r.data == nil {
-		r.err = io.EOF
-		return 0, r.err
-	}
-	n, rest := mem.ReadUnsafe(header, r.data)
-	r.data = rest
-	if r.data == nil && n < len(header) {
-		r.err = io.EOF
-	}
-	return n, nil
-}
-
-func (r *komaDirectReader) Read(n int) (mem.Buffer, error) {
-	if r.err != nil {
-		return nil, r.err
-	}
-	if err := r.contextErr(); err != nil {
-		r.err = err
-		return nil, err
-	}
-	if r.data == nil {
-		r.err = io.EOF
-		return nil, r.err
-	}
-	buf := r.data
-	if buf.Len() > n {
-		buf, r.data = mem.SplitUnsafe(buf, n)
-	} else {
-		r.data = nil
-	}
-	return buf, nil
-}
-
 func (r *komaUnaryResponse) freeDataFrames() {
 	for i := range r.dataFrames {
 		r.dataFrames[i].data.Free()
@@ -706,10 +640,12 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 		t.processCleanupStream(streamID, http2.ErrCodeFrameSize)
 		return nil, nil
 	}
+	buf := newRecvBuffer()
 	s := &ServerStream{
 		Stream: &Stream{
-			id: streamID,
-			fc: &inFlow{limit: uint32(t.initialWindowSize)},
+			id:  streamID,
+			buf: buf,
+			fc:  &inFlow{limit: uint32(t.initialWindowSize)},
 		},
 		st:               t,
 		headerWireLength: int(frame.Header().Length),
@@ -826,9 +762,8 @@ func (t *http2Server) operateHeadersKoma(ctx context.Context, frame *http2.MetaH
 
 	s.requestRead = func(n int) {}
 	s.trReader = &transportReader{
-		reader: &komaDirectReader{
-			ctx:     s.ctx,
-			ctxDone: s.ctxDone,
+		reader: &recvBufferReader{
+			recv: s.buf,
 		},
 		windowHandler: func(n int) {},
 	}
@@ -1339,7 +1274,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 				atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 				var stream *ServerStream
 				var ifNewStream bool
-				var requestData []byte
 				for _, frame := range frames {
 					switch frame := frame.(type) {
 					case *http2.MetaHeadersFrame:
@@ -1350,15 +1284,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 						stream = s
 						ifNewStream = true
 					case *http2.DataFrame:
-						if stream == nil {
-							continue
-						}
-						if data := frame.Data(); len(data) > 0 {
-							requestData = append(requestData, data...)
-						}
-						if frame.StreamEnded() {
-							stream.compareAndSwapState(streamActive, streamReadDone)
-						}
+						t.handleDataKoma(frame, stream)
 					default:
 						if t.logger.V(logLevel) {
 							t.logger.Infof("Received unsupported frame type %T", frame)
@@ -1367,9 +1293,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 				}
 				if !ifNewStream {
 					continue
-				}
-				if r, ok := stream.trReader.reader.(*komaDirectReader); ok {
-					r.setData(requestData)
 				}
 
 				dispatchAt := time.Time{}
