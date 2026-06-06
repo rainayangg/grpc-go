@@ -1180,7 +1180,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 		go t.runKomaTXLoop(t.komaTxCh)
 	}
 
-	rxToken := make(chan struct{}, 1)
+	rxToken := make(chan struct{})
 	var rxWG sync.WaitGroup
 	rxWG.Add(komaRXActorsPerFD)
 
