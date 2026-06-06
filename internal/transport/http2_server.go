@@ -80,7 +80,8 @@ var komaDoneEventFDWake = [8]byte{1}
 var komaDebugStatsEnabled = os.Getenv("GRPC_KOMA_DEBUG_STATS") != ""
 
 const (
-	komaTxThrottleLimit  = 4
+	komaTxThrottleLimit  = 10
+	komaRXActorsPerFD    = 2
 	komaDebugHistBuckets = 65
 )
 
@@ -1179,17 +1180,16 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 		go t.runKomaTXLoop(t.komaTxCh)
 	}
 
-	rxToken := make(chan struct{}, 1)
+	rxToken := make(chan struct{})
 	var rxWG sync.WaitGroup
-	var startRXActor func()
+	rxWG.Add(komaRXActorsPerFD)
 
-	startRXActor = func() {
-		rxWG.Add(1)
-		go func() {
-			defer rxWG.Done()
-			events := make([]unix.EpollEvent, 16)
-			var actorErr error
+	runRXActor := func() {
+		defer rxWG.Done()
+		events := make([]unix.EpollEvent, 16)
+		var actorErr error
 
+		for {
 			select {
 			case <-rxToken:
 			case <-t.done:
@@ -1306,7 +1306,6 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 				case <-t.done:
 					return
 				}
-				startRXActor()
 
 				if komaDebugStatsEnabled {
 					start := time.Now()
@@ -1319,12 +1318,14 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 				} else {
 					handle(stream)
 				}
-				return
+				break
 			}
-		}()
+		}
 	}
 
-	startRXActor()
+	for i := 0; i < komaRXActorsPerFD; i++ {
+		go runRXActor()
+	}
 	select {
 	case rxToken <- struct{}{}:
 	case <-t.done:
