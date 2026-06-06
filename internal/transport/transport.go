@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,41 +62,62 @@ type recvMsg struct {
 // interface. recvBuffer is written to much more often and using strict recvMsg
 // structs helps avoid allocation in "recvBuffer.put"
 type recvBuffer struct {
+	c       chan recvMsg
+	mu      sync.Mutex
 	backlog []recvMsg
-	curIdx  int
 	err     error
 }
 
 func newRecvBuffer() *recvBuffer {
-	b := &recvBuffer{curIdx: 0}
+	b := &recvBuffer{
+		c: make(chan recvMsg, 1),
+	}
 	return b
 }
 
 func (b *recvBuffer) put(r recvMsg) {
+	b.mu.Lock()
 	if b.err != nil {
-		if r.buffer != nil {
-			r.buffer.Free()
-		}
+		// drop the buffer on the floor. Since b.err is not nil, any subsequent reads
+		// will always return an error, making this buffer inaccessible.
+		r.buffer.Free()
+		b.mu.Unlock()
+		// An error had occurred earlier, don't accept more
+		// data or errors.
 		return
 	}
-	if r.err != nil {
-		b.err = r.err
+	b.err = r.err
+	if len(b.backlog) == 0 {
+		select {
+		case b.c <- r:
+			b.mu.Unlock()
+			return
+		default:
+		}
 	}
 	b.backlog = append(b.backlog, r)
+	b.mu.Unlock()
 }
 
-func (b *recvBuffer) next() recvMsg {
-	if b.curIdx >= len(b.backlog) {
-		// Either EOF or nothing left
-		if b.err != nil {
-			return recvMsg{err: b.err}
+func (b *recvBuffer) load() {
+	b.mu.Lock()
+	if len(b.backlog) > 0 {
+		select {
+		case b.c <- b.backlog[0]:
+			b.backlog[0] = recvMsg{}
+			b.backlog = b.backlog[1:]
+		default:
 		}
-		return recvMsg{err: io.EOF}
 	}
-	m := b.backlog[b.curIdx]
-	b.backlog[b.curIdx] = recvMsg{}
-	b.curIdx++
-	return m
+	b.mu.Unlock()
+}
+
+// get returns the channel that receives a recvMsg in the buffer.
+//
+// Upon receipt of a recvMsg, the caller should call load to send another
+// recvMsg onto the channel if there is any.
+func (b *recvBuffer) get() <-chan recvMsg {
+	return b.c
 }
 
 // recvBufferReader implements io.Reader interface to read the data from
@@ -117,9 +139,12 @@ func (r *recvBufferReader) ReadMessageHeader(header []byte) (n int, err error) {
 		n, r.last = mem.ReadUnsafe(header, r.last)
 		return n, nil
 	}
-	// No leftover → read next recvMsg
-	m := r.recv.next()
-	return r.readMessageHeaderAdditional(m, header)
+	if r.closeStream != nil {
+		n, r.err = r.readMessageHeaderClient(header)
+	} else {
+		n, r.err = r.readMessageHeader(header)
+	}
+	return n, r.err
 }
 
 // Read reads the next n bytes from last. If last is drained, it tries to read
@@ -139,79 +164,102 @@ func (r *recvBufferReader) Read(n int) (buf mem.Buffer, err error) {
 		}
 		return buf, nil
 	}
-	// No leftover → read next recvMsg
-	m := r.recv.next()
-	return r.readAdditional(m, n)
+	if r.closeStream != nil {
+		buf, r.err = r.readClient(n)
+	} else {
+		buf, r.err = r.read(n)
+	}
+	return buf, r.err
 }
 
-// func (r *recvBufferReader) readMessageHeaderClient(header []byte) (n int, err error) {
-// 	// If the context is canceled, then closes the stream with nil metadata.
-// 	// closeStream writes its error parameter to r.recv as a recvMsg.
-// 	// r.readAdditional acts on that message and returns the necessary error.
-// 	select {
-// 	case <-r.ctxDone:
-// 		// Note that this adds the ctx error to the end of recv buffer, and
-// 		// reads from the head. This will delay the error until recv buffer is
-// 		// empty, thus will delay ctx cancellation in Recv().
-// 		//
-// 		// It's done this way to fix a race between ctx cancel and trailer. The
-// 		// race was, stream.Recv() may return ctx error if ctxDone wins the
-// 		// race, but stream.Trailer() may return a non-nil md because the stream
-// 		// was not marked as done when trailer is received. This closeStream
-// 		// call will mark stream as done, thus fix the race.
-// 		//
-// 		// TODO: delaying ctx error seems like a unnecessary side effect. What
-// 		// we really want is to mark the stream as done, and return ctx error
-// 		// faster.
-// 		r.closeStream(ContextErr(r.ctx.Err()))
-// 		m := <-r.recv.get()
-// 		return r.readMessageHeaderAdditional(m, header)
-// 	case m := <-r.recv.get():
-// 		return r.readMessageHeaderAdditional(m, header)
-// 	}
-// }
+func (r *recvBufferReader) readMessageHeader(header []byte) (n int, err error) {
+	select {
+	case <-r.ctxDone:
+		return 0, ContextErr(r.ctx.Err())
+	case m := <-r.recv.get():
+		return r.readMessageHeaderAdditional(m, header)
+	}
+}
 
-// func (r *recvBufferReader) readClient(n int) (buf mem.Buffer, err error) {
-// 	// If the context is canceled, then closes the stream with nil metadata.
-// 	// closeStream writes its error parameter to r.recv as a recvMsg.
-// 	// r.readAdditional acts on that message and returns the necessary error.
-// 	select {
-// 	case <-r.ctxDone:
-// 		// Note that this adds the ctx error to the end of recv buffer, and
-// 		// reads from the head. This will delay the error until recv buffer is
-// 		// empty, thus will delay ctx cancellation in Recv().
-// 		//
-// 		// It's done this way to fix a race between ctx cancel and trailer. The
-// 		// race was, stream.Recv() may return ctx error if ctxDone wins the
-// 		// race, but stream.Trailer() may return a non-nil md because the stream
-// 		// was not marked as done when trailer is received. This closeStream
-// 		// call will mark stream as done, thus fix the race.
-// 		//
-// 		// TODO: delaying ctx error seems like a unnecessary side effect. What
-// 		// we really want is to mark the stream as done, and return ctx error
-// 		// faster.
-// 		r.closeStream(ContextErr(r.ctx.Err()))
-// 		m := <-r.recv.get()
-// 		return r.readAdditional(m, n)
-// 	case m := <-r.recv.get():
-// 		return r.readAdditional(m, n)
-// 	}
-// }
+func (r *recvBufferReader) read(n int) (buf mem.Buffer, err error) {
+	select {
+	case <-r.ctxDone:
+		return nil, ContextErr(r.ctx.Err())
+	case m := <-r.recv.get():
+		return r.readAdditional(m, n)
+	}
+}
+
+func (r *recvBufferReader) readMessageHeaderClient(header []byte) (n int, err error) {
+	// If the context is canceled, then closes the stream with nil metadata.
+	// closeStream writes its error parameter to r.recv as a recvMsg.
+	// r.readAdditional acts on that message and returns the necessary error.
+	select {
+	case <-r.ctxDone:
+		// Note that this adds the ctx error to the end of recv buffer, and
+		// reads from the head. This will delay the error until recv buffer is
+		// empty, thus will delay ctx cancellation in Recv().
+		//
+		// It's done this way to fix a race between ctx cancel and trailer. The
+		// race was, stream.Recv() may return ctx error if ctxDone wins the
+		// race, but stream.Trailer() may return a non-nil md because the stream
+		// was not marked as done when trailer is received. This closeStream
+		// call will mark stream as done, thus fix the race.
+		//
+		// TODO: delaying ctx error seems like a unnecessary side effect. What
+		// we really want is to mark the stream as done, and return ctx error
+		// faster.
+		r.closeStream(ContextErr(r.ctx.Err()))
+		m := <-r.recv.get()
+		return r.readMessageHeaderAdditional(m, header)
+	case m := <-r.recv.get():
+		return r.readMessageHeaderAdditional(m, header)
+	}
+}
+
+func (r *recvBufferReader) readClient(n int) (buf mem.Buffer, err error) {
+	// If the context is canceled, then closes the stream with nil metadata.
+	// closeStream writes its error parameter to r.recv as a recvMsg.
+	// r.readAdditional acts on that message and returns the necessary error.
+	select {
+	case <-r.ctxDone:
+		// Note that this adds the ctx error to the end of recv buffer, and
+		// reads from the head. This will delay the error until recv buffer is
+		// empty, thus will delay ctx cancellation in Recv().
+		//
+		// It's done this way to fix a race between ctx cancel and trailer. The
+		// race was, stream.Recv() may return ctx error if ctxDone wins the
+		// race, but stream.Trailer() may return a non-nil md because the stream
+		// was not marked as done when trailer is received. This closeStream
+		// call will mark stream as done, thus fix the race.
+		//
+		// TODO: delaying ctx error seems like a unnecessary side effect. What
+		// we really want is to mark the stream as done, and return ctx error
+		// faster.
+		r.closeStream(ContextErr(r.ctx.Err()))
+		m := <-r.recv.get()
+		return r.readAdditional(m, n)
+	case m := <-r.recv.get():
+		return r.readAdditional(m, n)
+	}
+}
 
 func (r *recvBufferReader) readMessageHeaderAdditional(m recvMsg, header []byte) (n int, err error) {
+	r.recv.load()
 	if m.err != nil {
 		if m.buffer != nil {
 			m.buffer.Free()
 		}
-		r.err = m.err
 		return 0, m.err
 	}
 
 	n, r.last = mem.ReadUnsafe(header, m.buffer)
+
 	return n, nil
 }
 
 func (r *recvBufferReader) readAdditional(m recvMsg, n int) (b mem.Buffer, err error) {
+	r.recv.load()
 	if m.err != nil {
 		if m.buffer != nil {
 			m.buffer.Free()
@@ -222,6 +270,7 @@ func (r *recvBufferReader) readAdditional(m recvMsg, n int) (b mem.Buffer, err e
 	if m.buffer.Len() > n {
 		m.buffer, r.last = mem.SplitUnsafe(m.buffer, n)
 	}
+
 	return m.buffer, nil
 }
 
