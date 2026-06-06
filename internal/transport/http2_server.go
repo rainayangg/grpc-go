@@ -2247,7 +2247,6 @@ func (t *http2Server) encodeAndSendKomaResponse(s *ServerStream) error {
 
 	rst := s.getState() == streamActive
 	t.finishStream(s, rst, http2.ErrCodeNo, trailingHeader, true)
-	t.deleteStream(s, true)
 	s.komaResp = nil
 	return nil
 }
