@@ -82,6 +82,7 @@ var komaDebugStatsEnabled = os.Getenv("GRPC_KOMA_DEBUG_STATS") != ""
 const (
 	komaTxThrottleLimit     = 10
 	komaHandlerWorkersPerFD = 1
+	komaHandlerYieldEvery   = 8
 	komaDebugHistBuckets    = 65
 )
 
@@ -1221,6 +1222,7 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 		}
 	}
 	events := make([]unix.EpollEvent, 16)
+	handlersSinceYield := 0
 
 	for {
 		if komaDebugStatsEnabled {
@@ -1299,17 +1301,16 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
 		// fmt.Printf("HandleStreamsKoma: start processing frames\n")
 		var stream *ServerStream
+		var ifNewStream bool
 		for _, frame := range frames {
 			switch frame := frame.(type) {
 			case *http2.MetaHeadersFrame:
 				s, err := t.operateHeadersKoma(ctx, frame, replyFrom)
-				if err != nil {
+				if err != nil || s == nil {
 					continue
 				}
 				stream = s
-				if !dispatchHandler(stream) {
-					return
-				}
+				ifNewStream = true
 				// stream.Mark = t.framer.komafr.GetMark()
 			case *http2.DataFrame:
 				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
@@ -1319,6 +1320,16 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 					t.logger.Infof("Received unsupported frame type %T", frame)
 				}
 
+			}
+		}
+		if ifNewStream {
+			if !dispatchHandler(stream) {
+				return
+			}
+			handlersSinceYield++
+			if handlersSinceYield >= komaHandlerYieldEvery {
+				handlersSinceYield = 0
+				runtime.Gosched()
 			}
 		}
 	}
