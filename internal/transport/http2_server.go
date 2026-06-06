@@ -130,13 +130,15 @@ type komaDebugStats struct {
 	txOutstandingMax uint64
 	txChLenMax       uint64
 
-	throttleWait komaDebugHist
-	epollWait    komaDebugHist
-	readFrames   komaDebugHist
-	handlerSched komaDebugHist
-	handlerRun   komaDebugHist
-	txEnqueue    komaDebugHist
-	txSend       komaDebugHist
+	throttleWait       komaDebugHist
+	epollWait          komaDebugHist
+	readFrames         komaDebugHist
+	handlerSched       komaDebugHist
+	handlerWorkerSched komaDebugHist
+	handlerGoSched     komaDebugHist
+	handlerRun         komaDebugHist
+	txEnqueue          komaDebugHist
+	txSend             komaDebugHist
 }
 
 func (h *komaDebugHist) record(d time.Duration) {
@@ -263,6 +265,8 @@ func (t *http2Server) dumpKomaStats(workerID int, komafd int) {
 	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("epoll", &stats.epollWait))
 	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("read_frames", &stats.readFrames))
 	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("handler_sched", &stats.handlerSched))
+	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("handler_worker_sched", &stats.handlerWorkerSched))
+	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("handler_go_sched", &stats.handlerGoSched))
 	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("handler_run", &stats.handlerRun))
 	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("tx_enqueue", &stats.txEnqueue))
 	fmt.Fprintf(os.Stderr, "KOMA_STATS_EXIT worker=%d fd=%d %s\n", workerID, komafd, komaDebugHistSummary("tx_send", &stats.txSend))
@@ -1135,7 +1139,9 @@ func (t *http2Server) runKomaHandlerWorker(ch <-chan komaHandlerWork, handle fun
 		case work := <-ch:
 			if komaDebugStatsEnabled {
 				start := time.Now()
-				t.komaStats.handlerSched.record(start.Sub(work.dispatchAt))
+				delay := start.Sub(work.dispatchAt)
+				t.komaStats.handlerSched.record(delay)
+				t.komaStats.handlerWorkerSched.record(delay)
 				handle(work.stream)
 				t.komaStats.handlerRun.record(time.Since(start))
 				continue
@@ -1200,7 +1206,9 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 				atomic.AddUint64(&t.komaStats.handlersGo, 1)
 				go func(work komaHandlerWork) {
 					start := time.Now()
-					t.komaStats.handlerSched.record(start.Sub(work.dispatchAt))
+					delay := start.Sub(work.dispatchAt)
+					t.komaStats.handlerSched.record(delay)
+					t.komaStats.handlerGoSched.record(delay)
 					handle(work.stream)
 					t.komaStats.handlerRun.record(time.Since(start))
 				}(work)
