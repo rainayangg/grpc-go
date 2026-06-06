@@ -100,17 +100,6 @@ type komaUnaryResponse struct {
 	sendCompress   string
 }
 
-type komaTxResponse struct {
-	stream         *ServerStream
-	from           unix.Sockaddr
-	payload        []byte
-	trailingHeader *headerFrame
-}
-
-type komaRouteWriter interface {
-	WriteToFrom([]byte, unix.Sockaddr) (int, error)
-}
-
 func (r *komaUnaryResponse) freeDataFrames() {
 	for i := range r.dataFrames {
 		r.dataFrames[i].data.Free()
@@ -364,7 +353,7 @@ type http2Server struct {
 	komaDoneHead      atomic.Pointer[ServerStream]
 	komaDoneMu        sync.Mutex
 	komaDoneEventFD   int
-	komaTxCh          chan *komaTxResponse
+	komaTxCh          chan *ServerStream
 	komaTxMu          sync.Mutex
 	komaTxOutstanding int
 	komaTxThrottleCh  chan struct{}
@@ -497,9 +486,9 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 	}
 	var buf bytes.Buffer // from loopyWriter
 	komaDoneEventFD := -1
-	var komaTxCh chan *komaTxResponse
+	var komaTxCh chan *ServerStream
 	if ifkoma {
-		komaTxCh = make(chan *komaTxResponse, 1024)
+		komaTxCh = make(chan *ServerStream, 1024)
 	}
 	t := &http2Server{
 		done:              done,
@@ -1344,16 +1333,16 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 	rxWG.Wait()
 }
 
-func (t *http2Server) runKomaTXLoop(ch <-chan *komaTxResponse) {
+func (t *http2Server) runKomaTXLoop(ch <-chan *ServerStream) {
 	for {
 		select {
-		case tx, ok := <-ch:
+		case s, ok := <-ch:
 			if !ok {
 				return
 			}
 			if komaDebugStatsEnabled {
 				start := time.Now()
-				err := t.sendKomaTxResponse(tx)
+				err := t.encodeAndSendKomaResponse(s)
 				t.komaStats.txSend.record(time.Since(start))
 				t.komaTxSent()
 				atomic.AddUint64(&t.komaStats.txSent, 1)
@@ -1363,7 +1352,7 @@ func (t *http2Server) runKomaTXLoop(ch <-chan *komaTxResponse) {
 				}
 				continue
 			}
-			err := t.sendKomaTxResponse(tx)
+			err := t.encodeAndSendKomaResponse(s)
 			t.komaTxSent()
 			if err != nil {
 				t.Close(err)
@@ -2171,15 +2160,11 @@ func (t *http2Server) Close(err error) {
 
 func (t *http2Server) publishKomaDone(s *ServerStream) error {
 	if t.komaTxCh != nil {
-		tx, err := t.buildKomaTxResponse(s)
-		if err != nil {
-			return err
-		}
 		t.komaTxQueued()
 		if komaDebugStatsEnabled {
 			start := time.Now()
 			select {
-			case t.komaTxCh <- tx:
+			case t.komaTxCh <- s:
 				t.komaStats.txEnqueue.record(time.Since(start))
 				atomic.AddUint64(&t.komaStats.txQueued, 1)
 				atomicMaxUint64(&t.komaStats.txChLenMax, uint64(len(t.komaTxCh)))
@@ -2191,7 +2176,7 @@ func (t *http2Server) publishKomaDone(s *ServerStream) error {
 			}
 		}
 		select {
-		case t.komaTxCh <- tx:
+		case t.komaTxCh <- s:
 			return nil
 		case <-t.done:
 			t.komaTxSent()
@@ -2233,175 +2218,37 @@ func (t *http2Server) drainKomaDoneList(head *ServerStream) error {
 }
 
 func (t *http2Server) encodeAndSendKomaResponse(s *ServerStream) error {
-	tx, err := t.buildKomaTxResponse(s)
-	if err != nil {
-		return err
-	}
-	return t.sendKomaTxResponse(tx)
-}
-
-func (t *http2Server) buildKomaTxResponse(s *ServerStream) (*komaTxResponse, error) {
 	resp := s.komaResp
 	if resp == nil || resp.status == nil {
-		return nil, errors.New("transport: incomplete KOMA unary response")
+		return errors.New("transport: incomplete KOMA unary response")
 	}
 	if s.KomaFrom == nil {
-		return nil, errors.New("transport: KOMA unary response missing route")
+		return errors.New("transport: KOMA unary response missing route")
 	}
 
+	t.framer.komafr.SetReplyFrom(s.KomaFrom)
 	defer resp.freeDataFrames()
-
-	var payload []byte
 	if resp.sendHeader {
-		var err error
-		payload, err = appendKomaHeaderFrame(payload, s.id, t.komaResponseHeaderFrame(s, resp))
-		if err != nil {
-			return nil, err
+		if err := t.processHeaderFrame(s.id, t.komaResponseHeaderFrame(s, resp)); err != nil {
+			return err
 		}
 	}
 
 	for _, df := range resp.dataFrames {
-		var err error
-		payload, err = appendKomaDataFrame(payload, s.id, df)
-		if err != nil {
-			return nil, err
+		if err := t.writeKomaDataFrame(s.id, df); err != nil {
+			return err
 		}
 	}
 
 	trailingHeader := t.komaResponseStatusFrame(s, resp)
-	payload, err := appendKomaHeaderFrame(payload, s.id, trailingHeader)
-	if err != nil {
-		return nil, err
+	if err := t.processHeaderFrame(s.id, trailingHeader); err != nil {
+		return err
 	}
 
 	rst := s.getState() == streamActive
-	if rst {
-		payload, err = appendKomaRSTStreamFrame(payload, s.id, http2.ErrCodeNo)
-		if err != nil {
-			return nil, err
-		}
-	}
+	t.finishStream(s, rst, http2.ErrCodeNo, trailingHeader, true)
 	s.komaResp = nil
-	return &komaTxResponse{
-		stream:         s,
-		from:           s.KomaFrom,
-		payload:        payload,
-		trailingHeader: trailingHeader,
-	}, nil
-}
-
-func (t *http2Server) sendKomaTxResponse(tx *komaTxResponse) error {
-	kw, ok := t.framer.komafr.KomaSocket.(komaRouteWriter)
-	if !ok {
-		return errors.New("transport: KOMA response writer missing route support")
-	}
-	n, err := kw.WriteToFrom(tx.payload, tx.from)
-	if err == nil && n != len(tx.payload) {
-		err = io.ErrShortWrite
-	}
-	if err != nil {
-		return err
-	}
-	t.finishStream(tx.stream, false, http2.ErrCodeNo, tx.trailingHeader, true)
 	return nil
-}
-
-func appendKomaFrameHeader(dst []byte, payloadLen int, typ http2.FrameType, flags http2.Flags, streamID uint32) ([]byte, error) {
-	if payloadLen >= 1<<24 {
-		return nil, http2.ErrFrameTooLarge
-	}
-	return append(dst,
-		byte(payloadLen>>16),
-		byte(payloadLen>>8),
-		byte(payloadLen),
-		byte(typ),
-		byte(flags),
-		byte(streamID>>24),
-		byte(streamID>>16),
-		byte(streamID>>8),
-		byte(streamID),
-	), nil
-}
-
-func appendKomaHeaderFrame(dst []byte, streamID uint32, h *headerFrame) ([]byte, error) {
-	if h.onWrite != nil {
-		h.onWrite()
-	}
-	var hbuf bytes.Buffer
-	henc := hpack.NewEncoder(&hbuf)
-	for _, f := range h.hf {
-		if err := henc.WriteField(f); err != nil {
-			return nil, err
-		}
-	}
-
-	first := true
-	for {
-		size := hbuf.Len()
-		if size > http2MaxFrameLen {
-			size = http2MaxFrameLen
-		}
-		endHeaders := hbuf.Len() == size
-
-		var (
-			err   error
-			flags http2.Flags
-			typ   http2.FrameType
-		)
-		if first {
-			first = false
-			typ = http2.FrameHeaders
-			if h.endStream {
-				flags |= http2.FlagHeadersEndStream
-			}
-			if endHeaders {
-				flags |= http2.FlagHeadersEndHeaders
-			}
-		} else {
-			typ = http2.FrameContinuation
-			if endHeaders {
-				flags |= http2.FlagContinuationEndHeaders
-			}
-		}
-
-		dst, err = appendKomaFrameHeader(dst, size, typ, flags, streamID)
-		if err != nil {
-			return nil, err
-		}
-		dst = append(dst, hbuf.Next(size)...)
-		if endHeaders {
-			return dst, nil
-		}
-	}
-}
-
-func appendKomaDataFrame(dst []byte, streamID uint32, df komaDataFrame) ([]byte, error) {
-	payloadSize := len(df.h) + df.data.Len()
-	dst, err := appendKomaFrameHeader(dst, payloadSize, http2.FrameData, 0, streamID)
-	if err != nil {
-		return nil, err
-	}
-	dst = append(dst, df.h...)
-	if dataSize := df.data.Len(); dataSize > 0 {
-		start := len(dst)
-		dst = append(dst, make([]byte, dataSize)...)
-		df.data.CopyTo(dst[start:])
-	}
-	return dst, nil
-}
-
-func appendKomaRSTStreamFrame(dst []byte, streamID uint32, code http2.ErrCode) ([]byte, error) {
-	dst, err := appendKomaFrameHeader(dst, 4, http2.FrameRSTStream, 0, streamID)
-	if err != nil {
-		return nil, err
-	}
-	code32 := uint32(code)
-	return append(dst,
-		byte(code32>>24),
-		byte(code32>>16),
-		byte(code32>>8),
-		byte(code32),
-	), nil
 }
 
 func (t *http2Server) writeKomaDataFrame(streamID uint32, df komaDataFrame) error {
