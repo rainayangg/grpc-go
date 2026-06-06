@@ -80,7 +80,7 @@ var komaDoneEventFDWake = [8]byte{1}
 var komaDebugStatsEnabled = os.Getenv("GRPC_KOMA_DEBUG_STATS") != ""
 
 const (
-	komaTxThrottleLimit  = 20
+	komaTxThrottleLimit  = 10
 	komaRXActorsPerFD    = 2
 	komaDebugHistBuckets = 65
 )
@@ -2247,6 +2247,7 @@ func (t *http2Server) encodeAndSendKomaResponse(s *ServerStream) error {
 
 	rst := s.getState() == streamActive
 	t.finishStream(s, rst, http2.ErrCodeNo, trailingHeader, true)
+	t.deleteStream(s, true)
 	s.komaResp = nil
 	return nil
 }
