@@ -364,7 +364,7 @@ type http2Server struct {
 	komaDoneHead      atomic.Pointer[ServerStream]
 	komaDoneMu        sync.Mutex
 	komaDoneEventFD   int
-	komaTxCh          chan *komaTxResponse
+	komaTxCh          chan *ServerStream
 	komaTxMu          sync.Mutex
 	komaTxOutstanding int
 	komaTxThrottleCh  chan struct{}
@@ -497,9 +497,9 @@ func NewServerTransport(conn net.Conn, config *ServerConfig, ifkoma bool) (_ Ser
 	}
 	var buf bytes.Buffer // from loopyWriter
 	komaDoneEventFD := -1
-	var komaTxCh chan *komaTxResponse
+	var komaTxCh chan *ServerStream
 	if ifkoma {
-		komaTxCh = make(chan *komaTxResponse, 1024)
+		komaTxCh = make(chan *ServerStream, 1024)
 	}
 	t := &http2Server{
 		done:              done,
@@ -1344,16 +1344,16 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 	rxWG.Wait()
 }
 
-func (t *http2Server) runKomaTXLoop(ch <-chan *komaTxResponse) {
+func (t *http2Server) runKomaTXLoop(ch <-chan *ServerStream) {
 	for {
 		select {
-		case tx, ok := <-ch:
+		case s, ok := <-ch:
 			if !ok {
 				return
 			}
 			if komaDebugStatsEnabled {
 				start := time.Now()
-				err := t.sendKomaTxResponse(tx)
+				err := t.encodeAndSendKomaResponse(s)
 				t.komaStats.txSend.record(time.Since(start))
 				t.komaTxSent()
 				atomic.AddUint64(&t.komaStats.txSent, 1)
@@ -1363,7 +1363,7 @@ func (t *http2Server) runKomaTXLoop(ch <-chan *komaTxResponse) {
 				}
 				continue
 			}
-			err := t.sendKomaTxResponse(tx)
+			err := t.encodeAndSendKomaResponse(s)
 			t.komaTxSent()
 			if err != nil {
 				t.Close(err)
@@ -2171,15 +2171,11 @@ func (t *http2Server) Close(err error) {
 
 func (t *http2Server) publishKomaDone(s *ServerStream) error {
 	if t.komaTxCh != nil {
-		tx, err := t.buildKomaTxResponse(s)
-		if err != nil {
-			return err
-		}
 		t.komaTxQueued()
 		if komaDebugStatsEnabled {
 			start := time.Now()
 			select {
-			case t.komaTxCh <- tx:
+			case t.komaTxCh <- s:
 				t.komaStats.txEnqueue.record(time.Since(start))
 				atomic.AddUint64(&t.komaStats.txQueued, 1)
 				atomicMaxUint64(&t.komaStats.txChLenMax, uint64(len(t.komaTxCh)))
@@ -2191,7 +2187,7 @@ func (t *http2Server) publishKomaDone(s *ServerStream) error {
 			}
 		}
 		select {
-		case t.komaTxCh <- tx:
+		case t.komaTxCh <- s:
 			return nil
 		case <-t.done:
 			t.komaTxSent()
