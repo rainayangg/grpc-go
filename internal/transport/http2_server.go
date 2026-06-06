@@ -1476,12 +1476,7 @@ func (t *http2Server) handleDataKoma(f *http2.DataFrame, s *ServerStream) {
 		if len(data) > 0 {
 			owned := make([]byte, len(data))
 			copy(owned, data)
-			buf := &mem.KomaBuffer{Data: owned}
-			if s.trReader != nil && s.trReader.reader != nil && s.trReader.reader.last == nil {
-				s.trReader.reader.last = buf
-			} else {
-				s.write(recvMsg{buffer: buf})
-			}
+			s.write(recvMsg{buffer: &mem.KomaBuffer{Data: owned}})
 		}
 	}
 	if f.StreamEnded() {
@@ -2252,6 +2247,7 @@ func (t *http2Server) encodeAndSendKomaResponse(s *ServerStream) error {
 
 	rst := s.getState() == streamActive
 	t.finishStream(s, rst, http2.ErrCodeNo, trailingHeader, true)
+	t.deleteStream(s, true)
 	s.komaResp = nil
 	return nil
 }
