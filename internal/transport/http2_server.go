@@ -80,10 +80,9 @@ var komaDoneEventFDWake = [8]byte{1}
 var komaDebugStatsEnabled = os.Getenv("GRPC_KOMA_DEBUG_STATS") != ""
 
 const (
-	komaTxThrottleLimit     = 10
-	komaHandlerWorkersPerFD = 1
-	komaHandlerYieldEvery   = 8
-	komaDebugHistBuckets    = 65
+	komaTxThrottleLimit  = 10
+	komaRXActorsPerFD    = 2
+	komaDebugHistBuckets = 65
 )
 
 type komaDataFrame struct {
@@ -110,11 +109,6 @@ func (r *komaUnaryResponse) freeDataFrames() {
 
 type komaDebugHist struct {
 	buckets [komaDebugHistBuckets]uint64
-}
-
-type komaHandlerWork struct {
-	stream     *ServerStream
-	dispatchAt time.Time
 }
 
 type komaDebugStats struct {
@@ -1134,27 +1128,6 @@ func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStre
 	}
 }
 
-func (t *http2Server) runKomaHandlerWorker(ch <-chan komaHandlerWork, handle func(*ServerStream)) {
-	for {
-		select {
-		case work := <-ch:
-			if komaDebugStatsEnabled {
-				start := time.Now()
-				delay := start.Sub(work.dispatchAt)
-				t.komaStats.handlerSched.record(delay)
-				t.komaStats.handlerWorkerSched.record(delay)
-				handle(work.stream)
-				t.komaStats.handlerRun.record(time.Since(start))
-				continue
-			}
-			handle(work.stream)
-		case <-t.done:
-			return
-		}
-	}
-}
-
-// HandleStreamsKoma receives incoming streams. The difference from the default one is that we do not give them to any handler directly. Instead, the handler function is called directly in serverWorker().
 func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerID int, handle func(*ServerStream)) {
 	defer close(t.readerDone)
 	if komaDebugStatsEnabled {
@@ -1181,158 +1154,151 @@ func (t *http2Server) HandleStreamsKoma(ctx context.Context, komafd int, workerI
 	if t.komaTxCh != nil {
 		go t.runKomaTXLoop(t.komaTxCh)
 	}
-	handlerCh := make(chan komaHandlerWork)
-	for i := 0; i < komaHandlerWorkersPerFD; i++ {
-		go t.runKomaHandlerWorker(handlerCh, handle)
-	}
-	dispatchHandler := func(stream *ServerStream) bool {
-		if stream == nil {
-			return true
-		}
-		work := komaHandlerWork{stream: stream}
-		if komaDebugStatsEnabled {
-			work.dispatchAt = time.Now()
-			atomic.AddUint64(&t.komaStats.handlersSpawned, 1)
-		}
-		select {
-		case handlerCh <- work:
-			if komaDebugStatsEnabled {
-				atomic.AddUint64(&t.komaStats.handlersWorker, 1)
-			}
-			return true
-		case <-t.done:
-			return false
-		default:
-			if komaDebugStatsEnabled {
-				atomic.AddUint64(&t.komaStats.handlersGo, 1)
-				go func(work komaHandlerWork) {
-					start := time.Now()
-					delay := start.Sub(work.dispatchAt)
-					t.komaStats.handlerSched.record(delay)
-					t.komaStats.handlerGoSched.record(delay)
-					handle(work.stream)
-					t.komaStats.handlerRun.record(time.Since(start))
-				}(work)
-				return true
-			}
-			go func(stream *ServerStream) {
-				handle(stream)
-			}(stream)
-			return true
-		}
-	}
-	events := make([]unix.EpollEvent, 16)
-	handlersSinceYield := 0
 
-	for {
-		if komaDebugStatsEnabled {
-			start := time.Now()
-			if !t.komaTxThrottle() {
-				t.komaStats.throttleWait.record(time.Since(start))
+	rxToken := make(chan struct{})
+	var rxWG sync.WaitGroup
+	rxWG.Add(komaRXActorsPerFD)
+
+	runRXActor := func() {
+		defer rxWG.Done()
+		events := make([]unix.EpollEvent, 16)
+		var actorErr error
+
+		for {
+			select {
+			case <-rxToken:
+			case <-t.done:
 				return
 			}
-			t.komaStats.throttleWait.record(time.Since(start))
-		} else if !t.komaTxThrottle() {
-			return
-		}
 
-		koma.KomaPull(komafd)
+			for {
+				if komaDebugStatsEnabled {
+					start := time.Now()
+					if !t.komaTxThrottle() {
+						t.komaStats.throttleWait.record(time.Since(start))
+						return
+					}
+					t.komaStats.throttleWait.record(time.Since(start))
+				} else if !t.komaTxThrottle() {
+					return
+				}
 
-		var n int
-		if komaDebugStatsEnabled {
-			start := time.Now()
-			n, err = unix.EpollWait(epfd, events, -1)
-			t.komaStats.epollWait.record(time.Since(start))
-		} else {
-			n, err = unix.EpollWait(epfd, events, -1)
-		}
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			t.Close(fmt.Errorf("epoll wait: %w", err))
-			return
-		}
+				koma.KomaPull(komafd)
 
-		rxReady := false
-		for i := 0; i < n; i++ {
-			fd := int(events[i].Fd)
-			if fd == komafd {
-				rxReady = true
-			}
-		}
-		if !rxReady {
-			continue
-		}
-
-		var frames []http2.Frame
-		var replyFrom unix.Sockaddr
-		if komaDebugStatsEnabled {
-			start := time.Now()
-			frames, replyFrom, err = t.framer.komafr.ReadFrames()
-			t.komaStats.readFrames.record(time.Since(start))
-			if err == nil {
-				atomic.AddUint64(&t.komaStats.rxDatagrams, 1)
-				atomic.AddUint64(&t.komaStats.rxFrames, uint64(len(frames)))
-			}
-		} else {
-			frames, replyFrom, err = t.framer.komafr.ReadFrames()
-		}
-		// timetrace.Record1("%d Read Frames", t.framer.komafr.GetMark())
-		// fmt.Printf("HandleStreamsKoma: finish Reading frames\n")
-		// fmt.Printf("%+v\n", frames)
-
-		if err != nil {
-			if _, ok := err.(http2.StreamError); ok {
-				fmt.Printf("Write RST stream for %d", frames[0].Header().StreamID)
-				t.framer.komafr.WriteRSTStream(frames[0].Header().StreamID, err.(http2.StreamError).Code)
-				continue
-			}
-			t.Close(err)
-			return
-		}
-
-		if frames == nil || len(frames) == 0 {
-			// fmt.Printf("HandleStreamsKoma: no frames read, continue\n")
-			continue
-		}
-
-		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
-		// in koma+grpc, every time we read from the kernel, it should be a full stream, starting with MetaHeadersFrame. Most of the cases, it should be a MetaHeadersFrame + DataFrame. In other words, the abstraction should be a stream instead of a frame.
-		// fmt.Printf("HandleStreamsKoma: start processing frames\n")
-		var stream *ServerStream
-		var ifNewStream bool
-		for _, frame := range frames {
-			switch frame := frame.(type) {
-			case *http2.MetaHeadersFrame:
-				s, err := t.operateHeadersKoma(ctx, frame, replyFrom)
-				if err != nil || s == nil {
+				var n int
+				if komaDebugStatsEnabled {
+					start := time.Now()
+					n, actorErr = unix.EpollWait(epfd, events, -1)
+					t.komaStats.epollWait.record(time.Since(start))
+				} else {
+					n, actorErr = unix.EpollWait(epfd, events, -1)
+				}
+				if actorErr == unix.EINTR {
 					continue
 				}
-				stream = s
-				ifNewStream = true
-				// stream.Mark = t.framer.komafr.GetMark()
-			case *http2.DataFrame:
-				// fmt.Printf("HandleStreamsKoma: !DataFrame\n")
-				t.handleDataKoma(frame, stream)
-			default:
-				if t.logger.V(logLevel) {
-					t.logger.Infof("Received unsupported frame type %T", frame)
+				if actorErr != nil {
+					t.Close(fmt.Errorf("epoll wait: %w", actorErr))
+					return
 				}
 
-			}
-		}
-		if ifNewStream {
-			if !dispatchHandler(stream) {
-				return
-			}
-			handlersSinceYield++
-			if handlersSinceYield >= komaHandlerYieldEvery {
-				handlersSinceYield = 0
-				runtime.Gosched()
+				rxReady := false
+				for i := 0; i < n; i++ {
+					if int(events[i].Fd) == komafd {
+						rxReady = true
+					}
+				}
+				if !rxReady {
+					continue
+				}
+
+				var frames []http2.Frame
+				var replyFrom unix.Sockaddr
+				if komaDebugStatsEnabled {
+					start := time.Now()
+					frames, replyFrom, actorErr = t.framer.komafr.ReadFrames()
+					t.komaStats.readFrames.record(time.Since(start))
+					if actorErr == nil {
+						atomic.AddUint64(&t.komaStats.rxDatagrams, 1)
+						atomic.AddUint64(&t.komaStats.rxFrames, uint64(len(frames)))
+					}
+				} else {
+					frames, replyFrom, actorErr = t.framer.komafr.ReadFrames()
+				}
+
+				if actorErr != nil {
+					if _, ok := actorErr.(http2.StreamError); ok {
+						fmt.Printf("Write RST stream for %d", frames[0].Header().StreamID)
+						t.framer.komafr.WriteRSTStream(frames[0].Header().StreamID, actorErr.(http2.StreamError).Code)
+						continue
+					}
+					t.Close(actorErr)
+					return
+				}
+
+				if len(frames) == 0 {
+					continue
+				}
+
+				atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+				var stream *ServerStream
+				var ifNewStream bool
+				for _, frame := range frames {
+					switch frame := frame.(type) {
+					case *http2.MetaHeadersFrame:
+						s, err := t.operateHeadersKoma(ctx, frame, replyFrom)
+						if err != nil || s == nil {
+							continue
+						}
+						stream = s
+						ifNewStream = true
+					case *http2.DataFrame:
+						t.handleDataKoma(frame, stream)
+					default:
+						if t.logger.V(logLevel) {
+							t.logger.Infof("Received unsupported frame type %T", frame)
+						}
+					}
+				}
+				if !ifNewStream {
+					continue
+				}
+
+				dispatchAt := time.Time{}
+				if komaDebugStatsEnabled {
+					dispatchAt = time.Now()
+					atomic.AddUint64(&t.komaStats.handlersSpawned, 1)
+				}
+
+				select {
+				case rxToken <- struct{}{}:
+				case <-t.done:
+					return
+				}
+
+				if komaDebugStatsEnabled {
+					start := time.Now()
+					delay := start.Sub(dispatchAt)
+					atomic.AddUint64(&t.komaStats.handlersWorker, 1)
+					t.komaStats.handlerSched.record(delay)
+					t.komaStats.handlerWorkerSched.record(delay)
+					handle(stream)
+					t.komaStats.handlerRun.record(time.Since(start))
+				} else {
+					handle(stream)
+				}
+				break
 			}
 		}
 	}
+
+	for i := 0; i < komaRXActorsPerFD; i++ {
+		go runRXActor()
+	}
+	select {
+	case rxToken <- struct{}{}:
+	case <-t.done:
+	}
+	rxWG.Wait()
 }
 
 func (t *http2Server) runKomaTXLoop(ch <-chan *ServerStream) {
